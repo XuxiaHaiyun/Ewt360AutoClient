@@ -1,0 +1,31 @@
+{
+    "description": "Web 客户端设备信息配置",
+    "device": {
+        "device_id": "",
+        "device_name": "Windows PC",
+        "device_type": "desktop",
+        "brand": "",
+        "model": "",
+        "os_version": "10",
+        "channel": ""
+    },
+    "api": {
+        "platform": "1",
+        "secret_id": "2",
+        "secret_key": "bdc739ff2dcf",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
+        "sdk_version": "3.0.37",
+        "origin": "https://www.ewt360.com",
+        "referer": "https://www.ewt360.com/"
+    },
+    "headers": {
+        "platform": "1",
+        "sec-ch-ua": "\"Not(A:Brand\";v=\"8\", \"Chromium\";v=\"147\", \"Microsoft Edge\";v=\"147\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"Windows\"",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "DNT": "1"
+    }
+}

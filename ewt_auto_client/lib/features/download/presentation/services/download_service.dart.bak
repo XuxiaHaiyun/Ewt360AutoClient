@@ -1,0 +1,1095 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:dio/dio.dart';
+import 'package:encrypt/encrypt.dart' as enc;
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:path_provider/path_provider.dart';
+
+import '../../../../core/network/api_helper.dart';
+import '../../../../core/network/dio_client.dart';
+import '../../../../core/network/network_logger.dart';
+import '../../../../core/network/proxy_adapter.dart';
+import '../../../../core/services/ffmpeg_service.dart';
+import '../../../../core/utils/web_file_saver.dart';
+import '../../../answer/data/datasources/answer_remote_datasource.dart';
+import '../../../answer/presentation/services/answer_service.dart';
+import '../../../player/data/datasources/player_remote_datasource.dart';
+import '../../../player/domain/entities/video_session.dart';
+import '../../../player/domain/services/video_source_resolver.dart';
+import '../../../player/presentation/dialogs/task_progress_dialog.dart';
+
+/// 课程下载服务
+///
+/// 对应 Python: tasks/course_download.py CourseDownloadTask
+/// 支持三种模式: guide (导学案PDF), video (视频), paper (试题)
+class DownloadService {
+  final DioClient _client;
+  final PlayerRemoteDataSource _playerRemote;
+  final AnswerRemoteDataSource _answerRemote;
+
+  /// 视频源解析器 (与实时点播共用, 对齐 Python _resolve_play_info)
+  late final VideoSourceResolver _resolver;
+
+  /// 外部请求专用 Dio (无拦截器, bytes 响应)
+  ///
+  /// DioClient 的 _dio 使用 ResponseType.plain + Sign/Auth 拦截器,
+  /// 会破坏二进制数据 (TS 段/DRM key) 并向 CDN 注入无关 headers。
+  /// 此实例对齐 Python 的 requests.get: 纯净 HTTP, 二进制安全。
+  late final Dio _extDio;
+
+  final _logController = StreamController<ProgressLogEvent>();
+  bool _cancelled = false;
+  bool _disposed = false;
+
+  DownloadService({required DioClient client})
+      : _client = client,
+        _playerRemote = PlayerRemoteDataSource(client),
+        _answerRemote = AnswerRemoteDataSource(client) {
+    _extDio = Dio(BaseOptions(
+      connectTimeout: const Duration(seconds: 30),
+      receiveTimeout: const Duration(minutes: 2),
+      responseType: ResponseType.bytes,
+      validateStatus: (_) => true,
+    ));
+    // 纳入网络日志范围（视频清单/直链下载请求）
+    NetworkLogger.attach(_extDio);
+    // 外部请求专用 Dio 同样走账号代理 (视频直链/TS 段/试题下载)
+    applyProxyAdapter(_extDio, client.proxy);
+    _resolver = VideoSourceResolver(
+      client: client,
+      onLog: (msg, {bool warning = false}) => _log(msg,
+          level: warning ? LogLevel.warning : LogLevel.info),
+    );
+  }
+
+  Stream<ProgressLogEvent> get logStream => _logController.stream;
+
+  void _log(String msg, {LogLevel level = LogLevel.info}) {
+    if (_disposed || _logController.isClosed) return;
+    _logController.add(ProgressLogEvent(msg, level: level));
+  }
+
+  void cancel() {
+    _cancelled = true;
+    _log('用户停止下载', level: LogLevel.warning);
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _logController.close();
+  }
+
+  /// 获取下载保存目录
+  Future<String> _getSaveDir(String subDir) async {
+    final dir = await getDownloadsDirectory() ??
+        await getApplicationDocumentsDirectory();
+    // 用 / 拼接 (Dart File/Directory 在所有平台都接受 /)
+    final saveDir = Directory('${dir.path}/EwtAutoClient/$subDir');
+    if (!saveDir.existsSync()) {
+      saveDir.createSync(recursive: true);
+    }
+    return saveDir.path;
+  }
+
+  // ─── 批量下载入口 ───
+
+  /// 批量下载导学案
+  Future<void> downloadGuides(
+    List<Map<String, dynamic>> courses, {
+    required String homeworkId,
+    required String schoolId,
+    void Function(int index, TaskProgressItem item)? onItemUpdate,
+  }) async {
+    final total = courses.length;
+    final saveDir = kIsWeb ? '<浏览器下载>' : await _getSaveDir('导学案');
+    _log('开始下载导学案, 共 $total 个课程'
+        '${kIsWeb ? ' (Web 平台, 浏览器下载)' : ', 保存至: $saveDir'}');
+
+    // 批量预取 PDF URL
+    final urlMap = await _prefetchGuideUrls(courses, homeworkId, schoolId);
+
+    int success = 0;
+    for (int i = 0; i < total; i++) {
+      if (_cancelled) break;
+      final course = courses[i];
+      final title = _courseTitle(course);
+      final lessonId = _lessonId(course);
+
+      onItemUpdate?.call(i, TaskProgressItem(
+        title: title, state: PlaybackState.playing, progress: 0.1,
+        message: '查找导学案...',
+      ));
+
+      try {
+        String? pdfUrl = urlMap[lessonId];
+        if (pdfUrl == null || pdfUrl.isEmpty) {
+          // 单次查询回退
+          pdfUrl = await _fetchSingleGuideUrl(course, homeworkId, schoolId);
+        }
+        if (pdfUrl == null || pdfUrl.isEmpty) {
+          throw Exception('该课程暂无导学案 PDF');
+        }
+
+        final filename = '${_sanitizeFilename(title)}.pdf';
+        if (kIsWeb) {
+          // Web: 拉 PDF 字节 + Blob 下载
+          final resp = await _extDio.get<List<int>>(
+            pdfUrl,
+            options: Options(
+              headers: _dlHeaders,
+              responseType: ResponseType.bytes,
+              receiveTimeout: const Duration(minutes: 3),
+              validateStatus: (s) => s != null && s >= 200 && s < 300,
+            ),
+          );
+          await WebFileSaver.saveBytes(
+              filename, Uint8List.fromList(resp.data ?? []));
+        } else {
+          // Native: 直链下载到文件
+          final filepath = '$saveDir/$filename';
+          await _downloadFile(pdfUrl, filepath);
+        }
+
+        success++;
+        _log('  ✓ $filename', level: LogLevel.success);
+        onItemUpdate?.call(i, TaskProgressItem(
+          title: title, state: PlaybackState.completed, progress: 1.0,
+          message: filename,
+        ));
+      } catch (e) {
+        _log('  ✗ $title: $e', level: LogLevel.error);
+        onItemUpdate?.call(i, TaskProgressItem(
+          title: title, state: PlaybackState.failed, progress: 1.0,
+          error: '$e',
+        ));
+      }
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+    _log('导学案下载完成: $success/$total', level: LogLevel.success);
+  }
+
+  /// 批量下载视频
+  ///
+  /// 对齐 Python: tasks/course_download.py execute (mode=video) + _download_video
+  /// 流程: getPlayerToken → getExternalVideoInfo → _resolvePlayInfo → _downloadHls/_downloadFile
+  ///
+  /// 平台支持:
+  /// - Native (Android/Windows): 写入用户下载目录 (dart:io File)
+  /// - Web: 通过 ffmpeg.wasm remux + Blob 触发浏览器下载 (无文件系统访问)
+  Future<void> downloadVideos(
+    List<Map<String, dynamic>> courses, {
+    required String homeworkId,
+    required String schoolId,
+    void Function(int index, TaskProgressItem item)? onItemUpdate,
+  }) async {
+    final total = courses.length;
+    // Web 端无文件系统, saveDir 仅用于 native 端路径展示
+    final saveDir = kIsWeb ? '<浏览器下载>' : await _getSaveDir('视频');
+    _log('开始下载视频, 共 $total 个课程'
+        '${kIsWeb ? ' (Web 平台, 浏览器下载)' : ', 保存至: $saveDir'}');
+
+    int success = 0;
+    for (int i = 0; i < total; i++) {
+      if (_cancelled) break;
+      final course = courses[i];
+      final title = _courseTitle(course);
+
+      onItemUpdate?.call(i, TaskProgressItem(
+        title: title, state: PlaybackState.playing, progress: 0.1,
+        message: '获取视频源...',
+      ));
+
+      try {
+        final filename = await _downloadOneVideo(
+          course,
+          homeworkId: homeworkId,
+          schoolId: schoolId,
+          saveDir: saveDir,
+        );
+        success++;
+        _log('  ✓ $filename', level: LogLevel.success);
+        onItemUpdate?.call(i, TaskProgressItem(
+          title: title, state: PlaybackState.completed, progress: 1.0,
+          message: filename,
+        ));
+      } catch (e) {
+        _log('  ✗ $title: $e', level: LogLevel.error);
+        onItemUpdate?.call(i, TaskProgressItem(
+          title: title, state: PlaybackState.failed, progress: 1.0,
+          error: '$e',
+        ));
+      }
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+    _log('视频下载完成: $success/$total', level: LogLevel.success);
+  }
+
+  /// 批量下载试题 (保存为 PDF)
+  ///
+  /// 对齐 Web "下载试卷"按钮行为: 调用服务端 `pst.ewt360.com` 异步生成试卷 PDF
+  /// 并下载。无本地回退, 失败直接抛出异常。
+  ///
+  /// 文件命名: {title}.pdf
+  ///
+  /// 流程 (每个课程):
+  /// 1. 调用 [AnswerService.executeBatch] 获取 `CourseAnswerResult` (含 paperId)
+  /// 2. 调用 [triggerPaperDownloadSwitch] + [triggerServerPaperPdf] 获取 PDF URL
+  /// 3. 用 [_extDio] 下载 PDF 字节, 写文件 (native) 或触发浏览器下载 (web)
+  Future<void> downloadPapers(
+    List<Map<String, dynamic>> courses, {
+    required String homeworkId,
+    required String schoolId,
+    void Function(int index, TaskProgressItem item)? onItemUpdate,
+  }) async {
+    final total = courses.length;
+    final saveDir = kIsWeb ? '<浏览器下载>' : await _getSaveDir('试题');
+    _log('开始下载试题, 共 $total 个课程'
+        '${kIsWeb ? ' (Web 平台, 浏览器下载)' : ', 保存至: $saveDir'}');
+
+    final answerService = AnswerService(client: _client);
+    int success = 0;
+
+    for (int i = 0; i < total; i++) {
+      if (_cancelled) break;
+      final course = courses[i];
+      final title = _courseTitle(course);
+
+      onItemUpdate?.call(i, TaskProgressItem(
+        title: title, state: PlaybackState.playing, progress: 0.1,
+        message: '获取题目...',
+      ));
+
+      try {
+        final results = await answerService.executeBatch(
+          [course],
+          homeworkId: homeworkId,
+          schoolId: schoolId,
+          method: 'direct',
+        );
+
+        if (results.isEmpty || results.first.questions.isEmpty) {
+          throw Exception('未获取到题目');
+        }
+
+        final result = results.first;
+        if (result.paperId.isEmpty) {
+          throw Exception('该课程未返回 paperId, 无法下载试卷');
+        }
+
+        final filename = '${_sanitizeFilename(title)}.pdf';
+
+        onItemUpdate?.call(i, TaskProgressItem(
+          title: title, state: PlaybackState.playing, progress: 0.3,
+          message: '服务端生成试卷中...',
+        ));
+        final pdfBytes = await _downloadServerPaperPdf(
+          paperId: result.paperId,
+          title: title,
+          onPoll: (attempt) {
+            onItemUpdate?.call(i, TaskProgressItem(
+              title: title, state: PlaybackState.playing, progress: 0.5,
+              message: '试卷生成中... (${attempt + 1})',
+            ));
+          },
+        );
+
+        // 写文件 (native) 或触发浏览器下载 (web)
+        if (kIsWeb) {
+          await WebFileSaver.saveBytes(filename, pdfBytes);
+        } else {
+          final filepath = '$saveDir/$filename';
+          await File(filepath).writeAsBytes(pdfBytes);
+        }
+
+        success++;
+        _log('  ✓ $filename (${result.successCount} 题)',
+            level: LogLevel.success);
+        onItemUpdate?.call(i, TaskProgressItem(
+          title: title, state: PlaybackState.completed, progress: 1.0,
+          message: filename,
+        ));
+      } catch (e) {
+        _log('  ✗ $title: $e', level: LogLevel.error);
+        onItemUpdate?.call(i, TaskProgressItem(
+          title: title, state: PlaybackState.failed, progress: 1.0,
+          error: '$e',
+        ));
+      }
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+
+    answerService.dispose();
+    _log('试题下载完成: $success/$total', level: LogLevel.success);
+  }
+
+  /// 通过服务端 print/async 接口下载试卷 PDF
+  ///
+  /// 对齐 Web "下载试卷"按钮行为:
+  /// 1. 调用 switch 接口触发服务端记录 (非关键, 失败不阻断)
+  /// 2. 调用 print/async 触发生成, 轮询 /api/query/list/ids 获取 PDF URL
+  /// 3. 用 [_extDio] 下载 PDF 字节
+  ///
+  /// [onPoll] 每次轮询时回调 (用于 UI 更新进度)
+  /// 失败抛异常 (调用方决定是否跳过该课程)
+  Future<Uint8List> _downloadServerPaperPdf({
+    required String paperId,
+    required String title,
+    void Function(int attempt)? onPoll,
+  }) async {
+    // 1. 触发 switch (非关键, 失败不阻断)
+    await _answerRemote.triggerPaperDownloadSwitch(paperId: paperId);
+
+    // 2. 触发生成 + 轮询 /api/query/list/ids 获取 PDF URL (1s 间隔, 最多 60 次)
+    final pdfInfo = await _answerRemote.triggerServerPaperPdf(
+      paperId: paperId,
+      title: title,
+      token: _client.token,
+      maxAttempts: 60,
+      onPoll: onPoll,
+    );
+
+    final filePath = pdfInfo['filePath']?.toString() ?? '';
+    if (filePath.isEmpty) {
+      throw Exception('服务端未返回 PDF 下载地址');
+    }
+
+    // 3. 下载 PDF 字节 (si.ewt360.com 直链, 无需鉴权)
+    final resp = await _extDio.get<List<int>>(
+      filePath,
+      options: Options(responseType: ResponseType.bytes),
+    );
+    final data = resp.data;
+    if (data == null || data.isEmpty) {
+      throw Exception('PDF 下载为空');
+    }
+    return Uint8List.fromList(data);
+  }
+
+  // ─── 导学案辅助 ───
+
+  Future<Map<String, String>> _prefetchGuideUrls(
+    List<Map<String, dynamic>> courses,
+    String homeworkId,
+    String schoolId,
+  ) async {
+    final lessonIds = <String>[];
+    final taskIds = <String>[];
+    for (final course in courses) {
+      final lid = _lessonId(course);
+      if (lid.isNotEmpty) {
+        lessonIds.add(lid);
+        taskIds.add((course['taskId'] ?? '').toString());
+      }
+    }
+    if (lessonIds.isEmpty || schoolId.isEmpty) return {};
+
+    try {
+      final result = await _answerRemote.getStudyGuideAndPractice(
+        schoolId: schoolId,
+        homeworkId: homeworkId,
+        taskIds: taskIds,
+        lessonIds: lessonIds,
+      );
+      final urlMap = <String, String>{};
+      List<dynamic> data = [];
+      if (result.containsKey('list')) {
+        data = (result['list'] as List<dynamic>?) ?? [];
+      } else if (result.containsKey('data')) {
+        data = (result['data'] as List<dynamic>?) ?? [];
+      }
+      for (final item in data) {
+        if (item is Map<String, dynamic>) {
+          final lid = (item['lessonId'] ?? '').toString();
+          final url = (item['studyGuidePdfWithWaterMark'] ?? '').toString();
+          if (lid.isNotEmpty && url.isNotEmpty) {
+            urlMap[lid] = url;
+          }
+        }
+      }
+      _log('  批量预取到 ${urlMap.length}/${lessonIds.length} 个导学案 URL');
+      return urlMap;
+    } catch (e) {
+      _log('  批量预取失败: $e', level: LogLevel.warning);
+      return {};
+    }
+  }
+
+  Future<String?> _fetchSingleGuideUrl(
+    Map<String, dynamic> course,
+    String homeworkId,
+    String schoolId,
+  ) async {
+    final lessonId = _lessonId(course);
+    if (lessonId.isEmpty || schoolId.isEmpty) return null;
+    try {
+      final result = await _answerRemote.getStudyGuideAndPractice(
+        schoolId: schoolId,
+        homeworkId: homeworkId,
+        taskIds: [(course['taskId'] ?? '').toString()],
+        lessonIds: [lessonId],
+      );
+      List<dynamic> data = [];
+      if (result.containsKey('list')) {
+        data = (result['list'] as List<dynamic>?) ?? [];
+      } else if (result.containsKey('data')) {
+        data = (result['data'] as List<dynamic>?) ?? [];
+      }
+      for (final item in data) {
+        if (item is Map<String, dynamic>) {
+          final url = (item['studyGuidePdfWithWaterMark'] ?? '').toString();
+          if (url.isNotEmpty) return url;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  视频下载 (对齐 Python: tasks/course_download.py _download_video)
+  // ═══════════════════════════════════════════════════════════════
+
+  /// 下载单个课程的视频文件
+  ///
+  /// 对齐 Python: _download_video
+  /// 流程:
+  ///   1. getPlayerToken(lessonId, bizCode) 获取播放令牌
+  ///   2. getExternalVideoInfo(lessonId, videoToken, bizCode) 获取视频列表
+  ///   3. 按 showPlat 选择:
+  ///      - 5 → 腾讯云 VOD: getplayinfo/v4 返回 m3u8 + drmToken (SimpleAES DRM)
+  ///      - 4 → 阿里云 VOD: HMAC-SHA1 签名 GetPlayInfo 返回 MP4/m3u8
+  ///   4. 用 ffmpeg 下载:
+  ///      - m3u8 / 带 drmToken → 自行拉流 + AES-128 解密 + 合并, ffmpeg 封装 mp4
+  ///      - 普通直链 MP4       → 流式下载
+  Future<String> _downloadOneVideo(
+    Map<String, dynamic> course, {
+    required String homeworkId,
+    required String schoolId,
+    required String saveDir,
+  }) async {
+    if (_cancelled) throw Exception('已取消');
+
+    final title = _courseTitle(course);
+    final contentId = _lessonId(course);
+    if (contentId.isEmpty) throw Exception('缺少 contentId');
+
+    // 对齐 Python: lesson_id_int = int(content_id)
+    final lessonIdInt = int.tryParse(contentId);
+    if (lessonIdInt == null) throw Exception('无效的 lessonId');
+
+    // 业务码: 课程/配置优先, 默认沿用 Web 端 1013
+    final bizCode = (course['videoBizCode'] ??
+            course['bizCode'] ??
+            '1013')
+        .toString();
+
+    // 步骤 1: 播放令牌 (对齐 Python: get_player_token)
+    final playToken = await _playerRemote.getPlayerToken(
+      schoolId: schoolId,
+      lessonId: contentId,
+      videoBizCode: bizCode,
+    );
+    if (playToken.isEmpty) throw Exception('播放令牌为空');
+
+    // 步骤 2: 外置视频信息 (对齐 Python: get_external_video_info)
+    final videoInfo = await _playerRemote.getExternalVideoInfo(
+      lessonId: contentId,
+      videoToken: playToken,
+      videoBizCode: bizCode,
+    );
+    final videoList = (videoInfo['videoList'] as List<dynamic>?) ?? [];
+    if (videoList.isEmpty) throw Exception('未找到视频源');
+
+    // 步骤 3: 解析播放地址 (腾讯云 VOD / 阿里云 VOD)
+    final play = await _resolver.resolve(videoInfo);
+    if (play == null || play.url.isEmpty) {
+      throw Exception('获取播放地址失败');
+    }
+
+    final url = play.url;
+    final drmToken = play.drmToken;
+    final isM3u8 = play.isM3u8;
+
+    // 步骤 4: 下载
+    final filename = '${_sanitizeFilename(title)}.mp4';
+
+    if (kIsWeb) {
+      // Web 平台: 内存版下载 + ffmpeg.wasm remux + 浏览器 Blob 下载
+      await _downloadVideoWeb(
+        url: url,
+        filename: filename,
+        isM3u8: isM3u8,
+        drmToken: drmToken,
+      );
+    } else {
+      // Native: 文件路径版 (dart:io File)
+      final filepath = '$saveDir/$filename';
+      if (isM3u8 || drmToken.isNotEmpty) {
+        await _downloadHls(url, filepath, drmToken);
+      } else {
+        await _downloadFile(url, filepath);
+      }
+    }
+
+    return filename;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  Web 平台下载 (无文件系统, 全内存 + ffmpeg.wasm + Blob 下载)
+  // ═══════════════════════════════════════════════════════════════
+
+  /// Web 平台视频下载: 内存版 HLS remux 或直链下载
+  ///
+  /// 与 native 端 [_downloadHls] / [_downloadFile] 对齐, 但全程不写文件,
+  /// 最终通过 [WebFileSaver] 触发浏览器下载。
+  Future<void> _downloadVideoWeb({
+    required String url,
+    required String filename,
+    required bool isM3u8,
+    required String drmToken,
+  }) async {
+    if (_cancelled) throw Exception('已取消');
+
+    Uint8List? mp4Bytes;
+
+    if (isM3u8 || drmToken.isNotEmpty) {
+      // HLS: 拉 m3u8 → TS 段下载 → AES 解密 → ffmpeg.wasm remux → MP4 bytes
+      final tsBytes = await _downloadHlsToBytes(url, drmToken);
+      // ffmpeg.wasm remux (TS → MP4)
+      _log('  HLS: ffmpeg.wasm 封装 -> $filename');
+      final result = await FfmpegService.instance.remuxToMp4Bytes(tsBytes);
+      if (result.error != null || result.bytes == null) {
+        throw Exception('ffmpeg.wasm 封装失败: ${result.error}');
+      }
+      mp4Bytes = result.bytes;
+    } else {
+      // 直链 MP4: 直接下载字节
+      _log('  下载直链 MP4: $filename');
+      final resp = await _extDio.get<List<int>>(
+        url,
+        options: Options(
+          headers: _dlHeaders,
+          responseType: ResponseType.bytes,
+          receiveTimeout: const Duration(minutes: 5),
+          validateStatus: (s) => s != null && s >= 200 && s < 300,
+        ),
+      );
+      mp4Bytes = Uint8List.fromList(resp.data ?? []);
+    }
+
+    if (mp4Bytes == null || mp4Bytes.isEmpty) {
+      throw Exception('下载到空数据');
+    }
+
+    // 触发浏览器下载
+    await WebFileSaver.saveBytes(filename, mp4Bytes);
+  }
+
+  /// Web 平台 HLS 下载: 拉 m3u8 + TS 段 + AES 解密, 返回拼接后的 TS 字节
+  ///
+  /// 与 native 端 [_downloadHls] 流程对齐, 但不写临时文件,
+  /// 直接返回内存中的 TS 字节序列, 由调用方传入 ffmpeg.wasm remux。
+  Future<Uint8List> _downloadHlsToBytes(String url, String drmToken) async {
+    if (_cancelled) throw Exception('已取消');
+
+    _log('  HLS 下载: 获取 m3u8...');
+
+    // 1. 拉 m3u8
+    var (content, base) = await _hlsFetchText(url, drmToken);
+    if (content == null) throw Exception('m3u8 获取失败');
+
+    // master playlist 展开
+    if (content.contains('#EXT-X-STREAM-INF')) {
+      final sub = _hlsFirstSub(content, base);
+      if (sub == null) throw Exception('m3u8 无子列表');
+      (content, base) = await _hlsFetchText(sub, '');
+      if (content == null) throw Exception('子 m3u8 获取失败');
+    }
+
+    // 2. 解析 key + segments
+    final parsed = _hlsParse(content, base);
+    final segments = parsed['segments'] as List<String>;
+
+    if (segments.isEmpty) {
+      // 嵌套 m3u8 兜底
+      for (final line in content.split('\n')) {
+        final t = line.trim();
+        if (t.isNotEmpty && !t.startsWith('#') && t.endsWith('.m3u8')) {
+          final nested = t.startsWith('http') ? t : '$base$t';
+          _log('  HLS: 嵌套 m3u8, 递归展开...');
+          return _downloadHlsToBytes(nested, drmToken);
+        }
+      }
+      throw Exception('m3u8 无 TS 段');
+    }
+
+    final keyUri = parsed['keyUri'] as String?;
+    final ivHex = parsed['ivHex'] as String?;
+
+    _log('  HLS: ${segments.length} 个 TS 段'
+        '${keyUri != null ? ", 有 DRM" : ""}'
+        '${keyUri != null && ivHex != null ? ", IV=$ivHex" : ""}');
+
+    // 3. 获取 key
+    Uint8List? key;
+    if (keyUri != null) {
+      key = await _hlsFetchKey(keyUri, drmToken);
+      if (key == null) throw Exception('DRM key 获取失败');
+      if (key.length != 16) {
+        throw Exception('DRM key 长度异常: ${key.length} (期望16)');
+      }
+    }
+
+    // 4. 逐段下载 + AES 解密 → 内存拼接
+    final iv = _parseIv(ivHex);
+    final buffer = BytesBuilder();
+    final total = segments.length;
+
+    for (int i = 0; i < total; i++) {
+      if (_cancelled) throw Exception('已取消');
+      final bytes = await _hlsFetchSegment(segments[i], drmToken);
+      if (bytes == null) {
+        throw Exception('TS 段 ${i + 1}/$total 下载失败');
+      }
+
+      Uint8List decrypted = bytes;
+      if (key != null) {
+        decrypted = _aesDecrypt(bytes, key, iv);
+        if (decrypted.isNotEmpty && decrypted[0] != 0x47) {
+          _log('  HLS: 段 ${i + 1} 解密首字节异常: 0x${decrypted[0].toRadixString(16)}',
+              level: LogLevel.warning);
+        }
+      }
+      buffer.add(decrypted);
+
+      if ((i + 1) % 20 == 0 || i == total - 1) {
+        _log('  HLS: ${i + 1}/$total 段');
+      }
+    }
+
+    final tsBytes = buffer.takeBytes();
+    if (tsBytes.isEmpty) throw Exception('未下载到任何数据');
+    return tsBytes;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  HLS / DRM 下载 (对齐 Python: _download_hls)
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // 视频源地址解析 (_resolvePlayInfo / 腾讯云 / 阿里云) 已提取到
+  // [VideoSourceResolver], 与实时点播共用。此处仅保留 HLS 段下载与解密逻辑。
+  //
+  // 直接把 m3u8 交给 ffmpeg 容易因 key URI / token 细节导致解析失败,
+  // 故对齐参考 downloader.js: 自行下载 m3u8 + key + 各 TS 段, AES-128-CBC 解密后合并,
+  // 最后用 ffmpeg 把拼接好的 TS 封装成 mp4。
+
+  String _truncateError(Object e) {
+    final s = e.toString();
+    if (s.length <= 120) return s;
+    final firstLine = s.split('\n').first;
+    if (firstLine.length <= 120) return firstLine;
+    return '${firstLine.substring(0, 117)}...';
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  HLS / DRM 下载 (对齐 Python: _download_hls)
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // 直接把 m3u8 交给 ffmpeg 容易因 key URI / token 细节导致解析失败,
+  // 故对齐参考 downloader.js: 自行下载 m3u8 + key + 各 TS 段, AES-128-CBC 解密后合并,
+  // 最后用 ffmpeg 把拼接好的 TS 封装成 mp4。
+
+  /// 下载请求头 (HLS m3u8 / TS / DRM key)
+  ///
+  /// 对齐 ewtdownloader/js/downloader.js 的 DL_HEADERS:
+  ///   Origin/Referer 必须用 teacher.ewt360.com (HLS CDN 校验 Origin,
+  ///   www.ewt360.com 会被拒 403)。
+  /// UA 用 EndpointConfig 的浏览器 UA (与网关请求一致), 不用 JS 里的移动端 UA。
+  Map<String, String> get _dlHeaders {
+    final cfg = _client.endpointConfig;
+    return {
+      'User-Agent': cfg.userAgent,
+      ...ApiHeaders.teacher,
+      'Accept': '*/*',
+      ...cfg.extraHeaders,
+    };
+  }
+
+  /// 向 URL 追加 token 参数 (对齐 Python: _append_token)
+  ///
+  /// token 值需 URL 编码, 对齐 JS encodeURIComponent
+  static String _appendToken(String url, String token) {
+    if (token.isEmpty || url.contains('token=')) return url;
+    final sep = url.contains('?') ? '&' : '?';
+    return '$url${sep}token=${Uri.encodeComponent(token)}';
+  }
+
+  /// 拉取 m3u8 文本, 返回 (内容, baseUrl); 失败返回 (null, '')
+  ///
+  /// 对齐 Python: _hls_fetch_text
+  Future<(String?, String)> _hlsFetchText(String url, String token) async {
+    final u = token.isNotEmpty ? _appendToken(url, token) : url;
+    try {
+      final resp = await _extDio.get<List<int>>(
+        u,
+        options: Options(headers: _dlHeaders),
+      );
+      // 对齐 Python: r.raise_for_status()
+      if (resp.statusCode != null && resp.statusCode! >= 400) {
+        _log('  HLS m3u8 HTTP ${resp.statusCode}', level: LogLevel.warning);
+        return (null, '');
+      }
+      final text = utf8.decode(resp.data ?? [], allowMalformed: true);
+      // 对齐 Python: url.rsplit("/", 1)[0] + "/"
+      final base = url.substring(0, url.lastIndexOf('/') + 1);
+      return (text, base);
+    } catch (e) {
+      _log('  HLS m3u8 获取失败: ${_truncateError(e)}', level: LogLevel.warning);
+      return (null, '');
+    }
+  }
+
+  /// 从 master playlist 取首个子列表地址
+  ///
+  /// 对齐 Python: _hls_first_sub
+  String? _hlsFirstSub(String content, String base) {
+    for (final line in content.split('\n')) {
+      final t = line.trim();
+      if (t.isNotEmpty && !t.startsWith('#')) {
+        return t.startsWith('http') ? t : '$base$t';
+      }
+    }
+    return null;
+  }
+
+  /// 解析 media playlist: 返回 {keyUri, ivHex, segments}
+  ///
+  /// 对齐 Python: _hls_parse
+  /// HLS 规范: METHOD=NONE 表示未加密, 但 Python 仅检查 URI 是否存在;
+  /// 无 #EXT-X-KEY 行或无 URI → keyUri 为 null → 不解密
+  Map<String, dynamic> _hlsParse(String content, String base) {
+    String? keyUri;
+    String? ivHex;
+    final segments = <String>[];
+
+    for (final line in content.split('\n')) {
+      final s = line.trim();
+      if (s.startsWith('#EXT-X-KEY')) {
+        // 对齐 Python: re.search(r'URI="([^"]*)"', s)
+        final uriMatch = RegExp(r'URI="([^"]*)"').firstMatch(s);
+        if (uriMatch != null) {
+          final ku = uriMatch.group(1) ?? '';
+          // 对齐 Python: ku if ku.startswith("http") else (base + ku if ku else None)
+          if (ku.isNotEmpty) {
+            keyUri = ku.startsWith('http') ? ku : '$base$ku';
+          }
+        }
+        // 对齐 Python: re.search(r'IV=(0x[0-9a-fA-F]+)', s)
+        final ivMatch = RegExp(r'IV=(0x[0-9a-fA-F]+)').firstMatch(s);
+        ivHex = ivMatch?.group(1);
+      } else if (s.startsWith('#') || s.isEmpty) {
+        continue;
+      } else {
+        // 对齐 Python: s if s.startswith("http") else base + s
+        segments.add(s.startsWith('http') ? s : '$base$s');
+      }
+    }
+    return {'keyUri': keyUri, 'ivHex': ivHex, 'segments': segments};
+  }
+
+  /// 拉取 DRM key (16 bytes 二进制), 带 token
+  ///
+  /// 对齐 Python: _hls_fetch_key
+  Future<Uint8List?> _hlsFetchKey(String keyUri, String token) async {
+    final u = token.isNotEmpty ? _appendToken(keyUri, token) : keyUri;
+    try {
+      final resp = await _extDio.get<List<int>>(
+        u,
+        options: Options(headers: _dlHeaders),
+      );
+      // 对齐 Python: r.raise_for_status()
+      if (resp.statusCode != null && resp.statusCode! >= 400) {
+        _log('  HLS key HTTP ${resp.statusCode}', level: LogLevel.warning);
+        return null;
+      }
+      return Uint8List.fromList(resp.data ?? []);
+    } catch (e) {
+      _log('  HLS key 获取失败: ${_truncateError(e)}', level: LogLevel.warning);
+      return null;
+    }
+  }
+
+  /// 拉取 TS 段 (二进制安全, 带 token 重试)
+  ///
+  /// 对齐 Python: _hls_fetch_segment
+  ///   1. 先不带 token 请求 (Python: urls = [seg])
+  ///   2. 若返回 m3u8 文本 (鉴权失败) 或非 200, 带 token 重试
+  Future<Uint8List?> _hlsFetchSegment(String segUrl, String token) async {
+    final urls = <String>[segUrl];
+    if (token.isNotEmpty && !segUrl.contains('token=')) {
+      urls.add(_appendToken(segUrl, token));
+    }
+    for (int idx = 0; idx < urls.length; idx++) {
+      final u = urls[idx];
+      try {
+        final resp = await _extDio.get<List<int>>(
+          u,
+          options: Options(
+            headers: _dlHeaders,
+            receiveTimeout: const Duration(seconds: 60),
+          ),
+        );
+        // 对齐 Python: if r.status_code != 200: continue
+        if (resp.statusCode != null && resp.statusCode! != 200) {
+          continue;
+        }
+        final data = resp.data ?? [];
+        // 对齐 Python: if r.content[:7] == b"#EXTM3U" and u != urls[-1]: continue
+        // (鉴权失败返回 m3u8 文本, 跳过尝试下一个 URL)
+        if (data.length > 7 &&
+            idx != urls.length - 1 &&
+            utf8.decode(data.sublist(0, 7), allowMalformed: true) == '#EXTM3U') {
+          continue;
+        }
+        return Uint8List.fromList(data);
+      } catch (_) {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  /// HLS(m3u8) 下载 + SimpleAES DRM 解密, 合并为 mp4。
+  ///
+  /// 对齐 Python: _download_hls
+  ///   1. 拉 m3u8 (master 展开到子列表)
+  ///   2. 取 DRM key (带 token) / 解析 TS 段
+  ///   3. 逐段下载 (无 token 失败再带 token) + AES-128-CBC 解密
+  ///   4. 拼接 TS -> 临时文件 -> ffmpeg 封装 mp4
+  Future<void> _downloadHls(
+      String url, String filepath, String drmToken) async {
+    if (_cancelled) throw Exception('已取消');
+
+    // ffmpeg 检查: 所有平台都支持 (Android/Windows 用 ffmpeg_kit_flutter_new_min,
+    // Web 用 ffmpeg.wasm), 仅校验是否成功初始化
+    await FfmpegService.instance.ensureInitialized();
+
+    _log('  HLS 下载: 获取 m3u8...');
+
+    // 1. 拉 m3u8 (对齐 Python: content, base = self._hls_fetch_text(url, drm_token))
+    var (content, base) = await _hlsFetchText(url, drmToken);
+    if (content == null) throw Exception('m3u8 获取失败');
+
+    // master playlist 展开
+    if (content.contains('#EXT-X-STREAM-INF')) {
+      final sub = _hlsFirstSub(content, base);
+      if (sub == null) throw Exception('m3u8 无子列表');
+      // 对齐 Python: self._hls_fetch_text(sub, "")
+      (content, base) = await _hlsFetchText(sub, '');
+      if (content == null) throw Exception('子 m3u8 获取失败');
+    }
+
+    // 2. 解析 key + segments
+    final parsed = _hlsParse(content, base);
+    final segments = parsed['segments'] as List<String>;
+
+    // 嵌套 m3u8 (子列表仍是 master) 兜底
+    // 对齐 Python: if not segments: ... 递归 _download_hls
+    if (segments.isEmpty) {
+      for (final line in content.split('\n')) {
+        final t = line.trim();
+        if (t.isNotEmpty && !t.startsWith('#') && t.endsWith('.m3u8')) {
+          final nested = t.startsWith('http') ? t : '$base$t';
+          _log('  HLS: 嵌套 m3u8, 递归展开...');
+          return _downloadHls(nested, filepath, drmToken);
+        }
+      }
+      throw Exception('m3u8 无 TS 段');
+    }
+
+    final keyUri = parsed['keyUri'] as String?;
+    final ivHex = parsed['ivHex'] as String?;
+
+    _log('  HLS: ${segments.length} 个 TS 段'
+        '${keyUri != null ? ", 有 DRM" : ""}'
+        '${keyUri != null && ivHex != null ? ", IV=$ivHex" : ""}');
+
+    // 3. 获取 key
+    Uint8List? key;
+    if (keyUri != null) {
+      key = await _hlsFetchKey(keyUri, drmToken);
+      if (key == null) throw Exception('DRM key 获取失败');
+      if (key.length != 16) {
+        throw Exception('DRM key 长度异常: ${key.length} (期望16)');
+      }
+    }
+
+    // 4. 逐段下载 + AES 解密
+    final iv = _parseIv(ivHex);
+    final buffer = BytesBuilder();
+    final total = segments.length;
+
+    for (int i = 0; i < total; i++) {
+      if (_cancelled) throw Exception('已取消');
+      final bytes = await _hlsFetchSegment(segments[i], drmToken);
+      if (bytes == null) {
+        throw Exception('TS 段 ${i + 1}/$total 下载失败');
+      }
+
+      Uint8List decrypted = bytes;
+      if (key != null) {
+        decrypted = _aesDecrypt(bytes, key, iv);
+        // 轻量校验: 解密后首字节应为 TS 同步字节 0x47
+        // 对齐 Python: if data and data[0] != 0x47
+        if (decrypted.isNotEmpty && decrypted[0] != 0x47) {
+          _log('  HLS: 段 ${i + 1} 解密首字节异常: 0x${decrypted[0].toRadixString(16)}',
+              level: LogLevel.warning);
+        }
+      }
+      buffer.add(decrypted);
+
+      if ((i + 1) % 20 == 0 || i == total - 1) {
+        _log('  HLS: ${i + 1}/$total 段');
+      }
+    }
+
+    final tsBytes = buffer.takeBytes();
+    if (tsBytes.isEmpty) throw Exception('未下载到任何数据');
+
+    // 5. 写入临时 TS, ffmpeg 封装 mp4
+    final tsPath = filepath.replaceAll('.mp4', '.ts');
+    await File(tsPath).writeAsBytes(tsBytes);
+
+    _log('  HLS: ffmpeg 封装 -> $filepath');
+    // 跨平台: 使用 ffmpeg_kit_flutter_new_min (Android/Windows), Web 已在入口拦截
+    final err = await FfmpegService.instance.remuxToMp4(
+      inputPath: tsPath,
+      outputPath: filepath,
+    );
+
+    // 对齐 Python: finally 删除临时 ts
+    try { File(tsPath).deleteSync(); } catch (_) {}
+
+    if (err != null) {
+      throw Exception('ffmpeg 封装失败: ${err.length > 400 ? err.substring(0, 400) : err}');
+    }
+
+    if (!File(filepath).existsSync() || File(filepath).lengthSync() == 0) {
+      throw Exception('ffmpeg 未产出文件');
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  文件下载 (对齐 Python: _download_file)
+  // ═══════════════════════════════════════════════════════════════
+
+  /// 流式下载直链文件到本地 (MP4 / PDF)
+  ///
+  /// 对齐 Python: _download_file
+  ///   headers = _get_dl_headers() + build_download_headers()
+  ///   requests.get(url, stream=True) → 逐块写入
+  /// 使用 _extDio (二进制安全), validateStatus 仅接受 2xx (覆盖 BaseOptions)
+  Future<void> _downloadFile(String url, String filepath) async {
+    try {
+      await _extDio.download(
+        url,
+        filepath,
+        options: Options(
+          headers: _dlHeaders,
+          receiveTimeout: const Duration(minutes: 5),
+          // 覆盖 _extDio 的 validateStatus: (_)=>true, 仅接受 2xx
+          // 对齐 Python: r.raise_for_status()
+          validateStatus: (s) => s != null && s >= 200 && s < 300,
+        ),
+      );
+    } catch (e) {
+      throw Exception('下载文件失败: ${_truncateError(e)}');
+    }
+  }
+
+  // ─── 工具方法 ───
+
+  String _courseTitle(Map<String, dynamic> course) {
+    return (course['title'] ?? course['taskTitle'] ?? course['name'] ?? '未命名')
+        .toString();
+  }
+
+  String _lessonId(Map<String, dynamic> course) {
+    return (course['lessonId'] ?? course['contentId'] ?? course['id'] ?? '')
+        .toString();
+  }
+
+  static String _sanitizeFilename(String name) {
+    final cleaned = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    final trimmed = cleaned.replaceAll(RegExp(r'^[.\s]+|[.\s]+$'), '');
+    return trimmed.isEmpty ? '未命名' : trimmed;
+  }
+
+  /// 解析 IV hex 为 16 字节 (对齐 Python: _hls_iv)
+  ///
+  /// Python: h = iv_hex[2:] if iv_hex.lower().startswith("0x") else iv_hex
+  ///         b = bytes.fromhex(h); if len(b) < 16: b = b.rjust(16, b"\x00")
+  ///         return b[:16]
+  /// 无 IV 时返回 16 字节全零 (HLS 默认 IV = sequence number, 但大多数实现用全零)
+  Uint8List _parseIv(String? ivHex) {
+    if (ivHex == null || ivHex.isEmpty) return Uint8List(16);
+    var hex = ivHex.toLowerCase().startsWith('0x')
+        ? ivHex.substring(2)
+        : ivHex;
+    // 对齐 Python: bytes.fromhex(h), 解析失败返回全零
+    final bytes = <int>[];
+    try {
+      for (int i = 0; i < hex.length; i += 2) {
+        bytes.add(int.parse(hex.substring(i, i + 2), radix: 16));
+      }
+    } catch (_) {
+      return Uint8List(16);
+    }
+    // 对齐 Python: if len(b) < 16: b = b.rjust(16, b"\x00"); return b[:16]
+    final result = Uint8List(16);
+    final offset = 16 - bytes.length;
+    for (int i = 0; i < bytes.length && i < 16; i++) {
+      result[offset + i] = bytes[i];
+    }
+    return result;
+  }
+
+  /// AES-128-CBC 解密 + PKCS7 去填充
+  ///
+  /// 对齐 Python: _aes_decrypt
+  ///   dec = AES.new(key, AES.MODE_CBC, iv).decrypt(data)
+  ///   if dec and 1 <= dec[-1] <= 16: ... 去 PKCS7 padding
+  /// 失败时抛出异常 (不返回加密数据, 避免生成损坏的 mp4)
+  Uint8List _aesDecrypt(Uint8List data, Uint8List key, Uint8List iv) {
+    try {
+      final decrypter = enc.Encrypter(enc.AES(
+        enc.Key(key),
+        mode: enc.AESMode.cbc,
+        padding: null,
+      ));
+      final decrypted = decrypter.decryptBytes(
+        enc.Encrypted(data),
+        iv: enc.IV(iv),
+      );
+      // 对齐 Python: 去 PKCS7 padding
+      if (decrypted.isNotEmpty) {
+        final pad = decrypted.last;
+        if (pad >= 1 && pad <= 16) {
+          final padValid = decrypted.length >= pad &&
+              decrypted.sublist(decrypted.length - pad).every((b) => b == pad);
+          if (padValid) {
+            return Uint8List.fromList(
+                decrypted.sublist(0, decrypted.length - pad));
+          }
+        }
+      }
+      return Uint8List.fromList(decrypted);
+    } catch (e) {
+      // 对齐 Python: 异常向上传播 (不返回加密数据, 避免损坏 mp4)
+      throw Exception('AES 解密失败: $e');
+    }
+  }
+}

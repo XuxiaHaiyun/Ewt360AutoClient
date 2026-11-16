@@ -1,0 +1,51 @@
+# ═══ 编译产物 / 构建输出 (任何位置都不入库) ═══
+**/build/
+**/out/
+**/.gradle/
+*.apk
+*.aab
+*.symbols
+
+# ═══ Flutter / Dart ═══
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+pubspec.lock
+
+# ═══ IDE ═══
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# ═══ 平台宿主本地产物 ═══
+ewt_auto_client/android/local.properties
+ewt_auto_client/android/app/debug/
+ewt_auto_client/android/app/profile/
+ewt_auto_client/android/app/release/
+ewt_auto_client/windows/flutter/ephemeral/
+
+# ═══ OS ═══
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ═══ 日志 ═══
+*.log
+
+# Chrome 设备缓存 (flutter run -d chrome 调试)
+.dart_tool/chrome-device/
+
+# ═══ Node (ffmpeg.wasm 本地构建) ═══
+node_modules/
+
+# ═══ Python (debug 脚本) 缓存 ═══
+**/__pycache__/
+**/*.pyc
+
+# ═══ 敏感数据: 真实账号 token (本地保留不入库) ═══
+ewt_auto_client/test/accounts.json

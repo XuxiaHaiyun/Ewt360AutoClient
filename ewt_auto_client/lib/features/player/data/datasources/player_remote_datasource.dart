@@ -1,0 +1,582 @@
+/// 播放器相关 API 数据源：封装播放器全局配置(BFE session)、播放 token、课时详情、
+/// 学习记录与任务进度、认真度检测(addVideoss/addVideocss)及互动视频等接口。
+/// 注意 schoolId/lessonId 需按服务端要求以 int 类型发送，否则会返回"参数错误"。
+library;
+
+import '../../../../core/constants/api_constants.dart';
+import '../../../../core/network/dio_client.dart';
+
+/// 播放器相关 API 数据源
+///
+/// 对应 Python: core/player.py PlayerMixin + core/homework.py 中播放器相关方法
+class PlayerRemoteDataSource {
+  final DioClient _client;
+
+  PlayerRemoteDataSource(this._client);
+
+  /// 获取播放器全局配置 (BFE session)
+  ///
+  /// GET /api/videoplayerprod/videoplayer/getPlayerGlobalConf
+  /// 响应: data.globalInfo.{secret, sessionId, clientIp}
+  Future<Map<String, dynamic>> getPlayerGlobalConf({
+    String videoBizCode = '1013',
+    String sdkVersion = '3.0.37',
+  }) async {
+    final response = await _client.get(
+      ApiConstants.playerGlobalConfUrl,
+      queryParameters: {
+        'videoBizCode': videoBizCode,
+        'sdkVersion': sdkVersion,
+        '_': DateTime.now().millisecondsSinceEpoch,
+      },
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('获取播放器配置失败: ${response.msg}');
+    }
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : {};
+  }
+
+  /// 获取播放 token
+  ///
+  /// POST /api/homeworkprod/player/getPlayerToken
+  /// 响应 data 可能是纯字符串 token, 也可能是 {"videoToken": "..."} 对象
+  ///
+  /// 注意: schoolId / lessonId 必须以 int 发送 (对齐 Python:
+  /// core/homework.py get_player_token, 服务端按数值类型校验),
+  /// 否则可能返回 "参数错误" 导致下载/播放失败。
+  ///
+  /// [memberAuthBypass] 高级设置"会员鉴权越权": 为 true 且默认 contentType=1 被
+  /// 会员门拦截("当前账号无权限播放")时, 自动回退 contentType=3 再取一次
+  /// (对齐实测: 非会员账号用 contentType=3 可绕过会员门签发可播放凭证)。
+  Future<String> getPlayerToken({
+    required String schoolId,
+    required String lessonId,
+    int type = 1,
+    int contentType = 1,
+    String videoBizCode = '1013',
+    bool memberAuthBypass = false,
+  }) async {
+    // 高级设置开启: ct1 被拦(无权限)时自动回退 ct=3 重试
+    if (memberAuthBypass && contentType == 1) {
+      String? first;
+      try {
+        final t =
+            await _postPlayerToken(schoolId, lessonId, type, 1, videoBizCode);
+        if (t.isNotEmpty) first = t;
+      } catch (_) {
+        first = null;
+      }
+      if (first != null) return first;
+      return _postPlayerToken(schoolId, lessonId, type, 3, videoBizCode);
+    }
+    return _postPlayerToken(schoolId, lessonId, type, contentType, videoBizCode);
+  }
+
+  /// getPlayerToken 底层单次请求 (不含回退逻辑)
+  Future<String> _postPlayerToken(
+    String schoolId,
+    String lessonId,
+    int type,
+    int contentType,
+    String videoBizCode,
+  ) async {
+    final response = await _client.post(
+      ApiConstants.playerTokenUrl,
+      data: {
+        // 对齐 Python: "schoolId": school_id (int), "lessonId": lesson_id (int)
+        'schoolId': int.tryParse(schoolId) ?? schoolId,
+        'lessonId': int.tryParse(lessonId) ?? lessonId,
+        'type': type,
+        'contentType': contentType,
+        'videoBizCode': videoBizCode,
+      },
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('获取播放Token失败: ${response.msg}');
+    }
+    final data = response.data;
+    if (data is String) return data;
+    if (data is Map<String, dynamic>) {
+      return data['videoToken']?.toString() ??
+          data['token']?.toString() ??
+          '';
+    }
+    return data?.toString() ?? '';
+  }
+
+  /// 获取外部视频信息（时长、互动点等）
+  ///
+  /// GET /api/videoplayerprod/videoplayer/getExternalVideoInfo
+  Future<Map<String, dynamic>> getExternalVideoInfo({
+    required String lessonId,
+    required String videoToken,
+    String videoBizCode = '1013',
+    String sdkVersion = '3.0.37',
+    int? contentType,
+  }) async {
+    final query = <String, dynamic>{
+      'videoBizCode': videoBizCode,
+      'lessonId': lessonId,
+      'videoToken': videoToken,
+      'sdkVersion': sdkVersion,
+      '_': DateTime.now().millisecondsSinceEpoch,
+    };
+    // 高级设置：会员鉴权越权回退 contentType=3 时也用 ct3 取可播配置
+    if (contentType != null) query['contentType'] = contentType;
+    final response = await _client.get(
+      ApiConstants.externalVideoInfoUrl,
+      queryParameters: query,
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('获取视频信息失败: ${response.msg}');
+    }
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : {};
+  }
+
+  /// 获取课时详情
+  ///
+  /// POST /api/homeworkprod/player/getLessonDetailV2
+  /// 后端强制要求 schoolId 必传 (报错: 学校id不能为空)
+  Future<Map<String, dynamic>> getLessonDetail({
+    required String schoolId,
+    required String homeworkId,
+    required String lessonId,
+  }) async {
+    final response = await _client.post(
+      ApiConstants.lessonDetailUrl,
+      data: {
+        'schoolId': schoolId,
+        'lessonId': lessonId,
+        'homeworkId': homeworkId,
+      },
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('获取课时详情失败: ${response.msg}');
+    }
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : {};
+  }
+
+  /// 提交学习记录 (record/submit)
+  ///
+  /// POST /api/studyprod/course/lesson/record/submit
+  Future<void> submitRecord({
+    required String courseId,
+    required String lessonId,
+    required int processTime,
+    required int finished,
+  }) async {
+    await _client.post(
+      ApiConstants.recordSubmitUrl,
+      data: {
+        'courseId': courseId,
+        'lessonId': lessonId,
+        'processTime': processTime,
+        'finished': finished,
+      },
+    );
+  }
+
+  /// 任务型直写完成 (FM=3 / 板报=5 等不走播放心跳的内容)
+  ///
+  /// POST /api/homeworkprod/homework/student/updateMission
+  /// body: {schoolId, contentId, contentType, percent}
+  /// 一次直写 percent=1 即视为完成, 无进度心跳, 与视频 BFE 流程完全无关。
+  ///
+  /// 对齐 ewt360-brush-main 的 _mission_direct_complete:
+  /// FM(3)/板报(5) 统一走 updateMission 直写 100%,
+  /// 不再使用单独的 /api/xinliprod/fm/record/submit 端点。
+  ///
+  /// [schoolId]    学校 ID (数字, 必传)
+  /// [contentId]   内容 ID (课时/板报 lessonId)
+  /// [contentType] 内容类型 (3=FM, 5=板报, ...)
+  /// [percent]     完成比例 (0~1, 默认 1=100%)
+  Future<void> completeMissionByContent({
+    required String schoolId,
+    required String contentId,
+    required int contentType,
+    int percent = 1,
+  }) async {
+    final response = await _client.post(
+      ApiConstants.updateMissionByContentUrl,
+      data: {
+        'schoolId': int.tryParse(schoolId) ?? 0,
+        'contentId': contentId,
+        'contentType': contentType,
+        'percent': percent,
+      },
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('任务直写完成失败: ${response.msg}');
+    }
+  }
+
+  /// 认真度检测 / 互动点上报 (非黑名单用户走 addVideoss, 对齐浏览器 ev 组件)
+  ///
+  /// 浏览器在认真度检测点 (webpack 模块 10217 的 ev 组件, 非黑名单) 中:
+  ///   componentDidMount 同时做两件事:
+  ///   1) 首报 addVideoss({...seriousCheckResult:0})  —— 无 token, 触发风控判定
+  ///   2) 主动挂载 ecaptcha 滑块并解算 -> 拿到 captchaToken (仅黑名单用户)
+  /// 解算完成后二次上报 addVideoss({...seriousCheckResult:2, captchaToken}) -> data:true 通过。
+  ///
+  /// 浏览器实测首报请求体:
+  ///   {"schoolId":40092,"homeworkId":10506865,"lessonId":"117742",
+  ///    "type":1,"interactivePointId":null,"platform":1,"seriousCheckResult":0}
+  /// 二次上报 (黑名单用户携带 captchaToken):
+  ///   {"...seriousCheckResult":2,"captchaToken":"fb3a848b-..."} -> data:true
+  ///
+  /// [type] 视频类型 (对齐 mstplayer_seriousness_check_doc.md §3'.6):
+  ///   - `interactiveVideo ? 3 : (contentType==1 ? 1 : 2)`
+  ///   - 1=普通视频 (contentType=1, 非互动)
+  ///   - 2=其他非互动视频 (contentType≠1, 如 contentType=11 校本视频)
+  ///   - 3=互动视频 (interactiveVideo=true)
+  /// [interactivePointId] 互动点 ID, 普通认真度检测点为 null (显式发送 null,
+  ///     与浏览器实测一致); 互动视频检测点传入 getInteractiveConfigDetail.id
+  /// [captchaToken] 滑块解算得到的 token (仅黑名单用户二次上报携带)
+  Future<Map<String, dynamic>> addVideoss({
+    required String schoolId,
+    required String homeworkId,
+    required String lessonId,
+    required int seriousCheckResult,
+    int type = 2,
+    String? interactivePointId,
+    String? captchaToken,
+  }) async {
+    return _addVideoCheck(
+      ApiConstants.addVideossUrl,
+      schoolId: schoolId,
+      homeworkId: homeworkId,
+      lessonId: lessonId,
+      seriousCheckResult: seriousCheckResult,
+      type: type,
+      interactivePointId: interactivePointId,
+      captchaToken: captchaToken,
+      apiName: 'addVideoss',
+    );
+  }
+
+  /// 黑名单用户认真度检测/互动点上报 (对齐浏览器 ek 组件 reportVideoPoint)
+  ///
+  /// 与 [addVideoss] 参数完全一致, 仅 URL 不同:
+  ///   - 非黑名单 (ev 组件) → POST /student/addVideoss
+  ///   - 黑名单 (ek 组件)   → POST /student/addVideocss
+  ///
+  /// 浏览器 ek 组件 (黑名单) 在 componentDidMount / 滑块成功回调 / 倒计时超时
+  /// 三种时机分别上报 seriousCheckResult: 0 / 2 / 1, 全部走 addVideocss。
+  Future<Map<String, dynamic>> addVideocss({
+    required String schoolId,
+    required String homeworkId,
+    required String lessonId,
+    required int seriousCheckResult,
+    int type = 2,
+    String? interactivePointId,
+    String? captchaToken,
+  }) async {
+    return _addVideoCheck(
+      ApiConstants.addVideocssUrl,
+      schoolId: schoolId,
+      homeworkId: homeworkId,
+      lessonId: lessonId,
+      seriousCheckResult: seriousCheckResult,
+      type: type,
+      interactivePointId: interactivePointId,
+      captchaToken: captchaToken,
+      apiName: 'addVideocss',
+    );
+  }
+
+  /// 认真度检测/互动点上报公共实现 (addVideoss / addVideocss 共用)
+  ///
+  /// 两个接口参数体完全相同, 仅 URL 不同:
+  ///   - 非黑名单 → addVideossUrl (ev 组件 _submitEarnestCheck → ep 函数)
+  ///   - 黑名单   → addVideocssUrl (ek 组件 reportVideoPoint)
+  Future<Map<String, dynamic>> _addVideoCheck(
+    String url, {
+    required String schoolId,
+    required String homeworkId,
+    required String lessonId,
+    required int seriousCheckResult,
+    required int type,
+    required String? interactivePointId,
+    required String? captchaToken,
+    required String apiName,
+  }) async {
+    final payload = <String, dynamic>{
+      'schoolId': int.tryParse(schoolId) ?? 0,
+      'homeworkId': int.tryParse(homeworkId) ?? 0,
+      'lessonId': lessonId,
+      'type': type,
+      'interactivePointId': interactivePointId,
+      'platform': 1,
+      'seriousCheckResult': seriousCheckResult,
+    };
+    // captchaToken 仅黑名单用户二次上报携带 (由调用方控制是否传入)
+    if (captchaToken != null && captchaToken.isNotEmpty) {
+      payload['captchaToken'] = captchaToken;
+    }
+    final response = await _client.post(
+      url,
+      data: payload,
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('$apiName 上报失败: ${response.msg}');
+    }
+    // 服务端成功时 data 为 bool (true) 而非 Map, 用类型判断避免 as 强转抛 CastError
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : <String, dynamic>{};
+  }
+
+  /// 获取认真度检测降级配置
+  ///
+  /// 对应浏览器播放页: 进入时调用此接口判定认真度检测功能是否可用
+  /// GET /api/eteacherproduct/downgrade/getSeriousCheckDownGradeConfig
+  /// 响应: data.{level, tips, needLog, description}
+  ///
+  /// 对齐文档 mstplayer_seriousness_check_doc.md §2.0.5:
+  /// [level]==0: 正常检测, 执行完整流程 (首报 → 滑块 → 二次上报)
+  /// [level]>0:  降级模式, 仅记录日志不执行打断/滑块 (高峰期兜底)
+  Future<Map<String, dynamic>> getSeriousCheckDownGradeConfig({
+    required String schoolId,
+    int videoType = 1,
+  }) async {
+    final response = await _client.get(
+      ApiConstants.seriousCheckDownGradeConfigUrl,
+      queryParameters: {
+        'schoolId': schoolId,
+        'videoType': videoType,
+      },
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('获取认真度检测配置失败: ${response.msg}');
+    }
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : <String, dynamic>{};
+  }
+
+  /// 获取用户基础信息 (baseinfo)
+  ///
+  /// GET /api/usercenter/user/baseinfo
+  /// 响应字段: realName / account / mobile / schoolName / memberProvinceCode /
+  ///          memberProvinceName / photoUrl / memberTypeName / areaCode ...
+  ///
+  /// 用于补全 [UserSession] 中可能缺失的 account / provinceCode / schoolName 等
+  /// 字段 (例如 token 直登场景 accounts.json 仅有 token, 或登录流程未填充)。
+  Future<Map<String, dynamic>> getBaseInfo() async {
+    final response =
+        await _client.get<Map<String, dynamic>>(ApiConstants.baseInfoUrl);
+    if (!response.isSuccess) {
+      throw NetworkException('获取用户基础信息失败: ${response.msg}');
+    }
+    final data = response.data;
+    if (data == null) return <String, dynamic>{};
+    return data;
+  }
+
+  /// 获取用户登录信息 (getUser)
+  ///
+  /// GET /api/usercenter/user/login/getUser
+  /// 响应字段: userName / nickName / avatar / mobile / userId ...
+  ///
+  /// 用于补全 [UserSession] 中的 account (对应首页"用户名"字段, 即 userName)。
+  /// baseinfo API 不返回 account/userName, 必须通过本接口获取。
+  Future<Map<String, dynamic>> getUser() async {
+    final response =
+        await _client.get<Map<String, dynamic>>(ApiConstants.userInfoUrl);
+    if (!response.isSuccess) {
+      throw NetworkException('获取用户登录信息失败: ${response.msg}');
+    }
+    final data = response.data;
+    if (data == null) return <String, dynamic>{};
+    return data;
+  }
+
+  /// 刷新任务进度
+  ///
+  /// POST /api/homeworkprod/student/homework/task/refreshTaskProgress
+  Future<Map<String, dynamic>> refreshTaskProgress({
+    required String homeworkId,
+    required String taskId,
+  }) async {
+    final response = await _client.post(
+      ApiConstants.refreshTaskProgressUrl,
+      data: {
+        'homeworkId': homeworkId,
+        'taskId': taskId,
+      },
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('刷新进度失败: ${response.msg}');
+    }
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : <String, dynamic>{};
+  }
+
+  /// 批量刷新任务进度 (返回每个任务的 ratio)
+  ///
+  /// 对应 Python: core/player.py refresh_task_progress
+  /// POST /api/homeworkprod/student/homework/task/refreshTaskProgress
+  /// 响应: data = [{taskId, ratio, finishPercent, ...}, ...]
+  Future<List<Map<String, dynamic>>> refreshTaskProgressBatch({
+    required List<String> taskIds,
+    required String schoolId,
+  }) async {
+    final response = await _client.post(
+      ApiConstants.refreshTaskProgressUrl,
+      data: {
+        'taskIds': taskIds,
+        'schoolId': schoolId,
+      },
+    );
+    if (!response.isSuccess) return [];
+    final data = response.data;
+    if (data is List) {
+      return data.whereType<Map<String, dynamic>>().toList();
+    }
+    return [];
+  }
+
+  /// 查询任务进度 (taskProgressV1)
+  ///
+  /// 对应 Python: core/player.py query_task_progress
+  /// POST /api/homeworkprod/homework/student/taskProgressV1
+  Future<List<Map<String, dynamic>>> queryTaskProgress({
+    required List<String> taskIds,
+    int sourceType = 2,
+    String schoolId = '',
+  }) async {
+    final payload = <String, dynamic>{
+      'taskIds': taskIds,
+      'sourceType': sourceType,
+    };
+    if (schoolId.isNotEmpty) payload['schoolId'] = schoolId;
+    final response = await _client.post(
+      ApiConstants.taskProgressUrl,
+      data: payload,
+    );
+    if (!response.isSuccess) return [];
+    final data = response.data;
+    if (data is List) {
+      return data.whereType<Map<String, dynamic>>().toList();
+    }
+    return [];
+  }
+
+  /// 获取课时任务信息 (含 playTime / lessonTime)
+  ///
+  /// 对应 Python: core/player.py get_user_homework_lesson_task_info
+  /// POST /api/homeworkprod/homework/student/getUserHomeworkLessonTaskInfo
+  /// 响应: data = {playTime(ms), lessonTime(ms), finishPercent, ...}
+  Future<Map<String, dynamic>> getLessonTaskInfo({
+    required String homeworkId,
+    required String lessonId,
+    int contentType = 1,
+    String schoolId = '',
+  }) async {
+    final payload = <String, dynamic>{
+      'homeworkId': homeworkId,
+      'lessonId': lessonId,
+      'contentType': contentType,
+    };
+    if (schoolId.isNotEmpty) payload['schoolId'] = schoolId;
+    final response = await _client.post(
+      ApiConstants.lessonTaskInfoUrl,
+      data: payload,
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('获取课时任务信息失败: ${response.msg}');
+    }
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : <String, dynamic>{};
+  }
+
+  /// 获取互动视频配置详情
+  ///
+  /// 对应 Python: core/player.py get_interactive_config_detail
+  /// GET /api/videoplayerprod/videoplayer/getInteractiveConfigDetail
+  ///
+  /// Query 参数名必须是 `interactiveConfigId` (服务端 Long 类型必传参数,
+  /// 对齐浏览器 mstplayer BizInteractive 插件 / debug 抓包文档):
+  ///   传错参数名会报 "Required Long parameter 'interactiveConfigId' is not present"
+  /// 响应: data = {interactiveSceneId, interactiveName, interactiveTimePoint,
+  ///               question: {id, options, imageUrl}}
+  Future<Map<String, dynamic>> getInteractiveConfigDetail({
+    required String configId,
+    String videoBizCode = '1013',
+  }) async {
+    final response = await _client.get(
+      ApiConstants.interactiveConfigUrl,
+      queryParameters: {
+        'interactiveConfigId': configId,
+        'videoBizCode': videoBizCode,
+        '_': DateTime.now().millisecondsSinceEpoch,
+      },
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('获取互动配置失败: ${response.msg}');
+    }
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : <String, dynamic>{};
+  }
+
+  /// 提交互动视频答案
+  ///
+  /// 对应 Python: core/player.py submit_interactive_answer
+  /// POST /api/videoplayerprod/videoplayer/submitAnswer
+  /// 响应: data = {answers: [...], rightStatus: 0/1}
+  Future<Map<String, dynamic>> submitInteractiveAnswer({
+    required String interactiveSceneId,
+    required String questionId,
+    required List<String> myAnswers,
+    int totalSeconds = 1,
+    String videoBizCode = '1013',
+    String lessonId = '',
+  }) async {
+    final response = await _client.post(
+      ApiConstants.submitAnswerUrl,
+      data: {
+        'interactiveSceneId': interactiveSceneId,
+        'questionId': questionId,
+        'myAnswers': myAnswers,
+        'totalSeconds': totalSeconds,
+        'videoBizCode': videoBizCode,
+        if (lessonId.isNotEmpty) 'lessonId': lessonId,
+      },
+    );
+    if (!response.isSuccess) {
+      throw NetworkException('提交互动答案失败: ${response.msg}');
+    }
+    final data = response.data;
+    return data is Map<String, dynamic> ? data : <String, dynamic>{};
+  }
+
+  /// 查询用户是否在认真度检测黑名单 (对齐 §3'.7.1)
+  ///
+  /// GET /api/homeworkprod/homework/student/getVideodp
+  /// 返回: {success, code:"200", msg, data:bool}
+  ///   data=true  → 用户已在黑名单, 走滑块型 (ek 组件, ecaptcha)
+  ///   data=false → 普通用户, 走确认型 (ev 组件, 仅点击"我知道了")
+  ///
+  /// 浏览器播放页在 initVideoPlayer / changeVideo 中调用此接口同步黑名单状态。
+  Future<bool> getVideodp() async {
+    final response = await _client.get(
+      ApiConstants.videodpUrl,
+      queryParameters: {
+        '_': DateTime.now().millisecondsSinceEpoch,
+      },
+    );
+    if (!response.isSuccess) return false;
+    final data = response.data;
+    if (data is bool) return data;
+    if (data is String) return data.toLowerCase() == 'true';
+    if (data is num) return data != 0;
+    if (data is Map<String, dynamic>) {
+      final v = data['data'];
+      if (v is bool) return v;
+      if (v is String) return v.toLowerCase() == 'true';
+    }
+    return false;
+  }
+}
+

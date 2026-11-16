@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <!--
+    If you are serving your web app in a path other than the root, change the
+    href value below to reflect the base path you are serving from.
+
+    The path provided below has to start and end with a slash "/" in order for
+    it to work correctly.
+
+    For more details:
+    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
+
+    This is a placeholder for base href that will be replaced by the value of
+    the `--base-href` argument provided to `flutter build`.
+  -->
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="A new Flutter project.">
+
+  <!-- iOS meta tags & icons -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="ewt_auto_client">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="favicon.png"/>
+
+  <title>ewt_auto_client</title>
+  <link rel="manifest" href="manifest.json">
+
+  <!--
+    ffmpeg.wasm 依赖 (Web 平台视频下载 HLS remux):
+      @ffmpeg/ffmpeg - 主库 (FFmpegWASM.FFmpeg 类)
+      @ffmpeg/util   - 工具 (fetchFile 加载 core wasm)
+    core wasm 由 web/ffmpeg_bridge.js 运行时从 CDN 按需拉取, 无需在此静态引入。
+    版本固定: ffmpeg@0.12.10 / util@0.12.1 (与 ffmpeg_bridge.js 中 core 0.12.6 匹配)
+  -->
+  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+  <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+  <script src="ffmpeg_bridge.js"></script>
+
+  <style>
+    /*
+     * 移动端 web 长按（onLongPress）时，iOS Safari / 部分 Android 浏览器
+     * 会弹出系统自带的文字选择 / 操作菜单（callout）。
+     * 该属性仅作用于触摸长按 callout，不影响普通文本选择逻辑，
+     * 与 app 内的 ContextMenuRegion 自定义菜单互不冲突。
+     */
+    html, body {
+      -webkit-touch-callout: none;
+    }
+  </style>
+
+  <script>
+    // 屏蔽浏览器自带右键菜单，统一使用 app 内的自定义菜单 (ContextMenuRegion)。
+    // Flutter 的 onSecondaryTapDown 基于 pointerdown 事件，与本事件相互独立，
+    // 因此 preventDefault 不影响自定义菜单的正常弹出。
+    // 可编辑元素（输入框等）保留原生右键（拼写检查 / 粘贴菜单）。
+    (function () {
+      document.addEventListener('contextmenu', function (e) {
+        var t = e.target;
+        var tag = t && t.tagName ? t.tagName.toLowerCase() : '';
+        var editable = tag === 'input' || tag === 'textarea' || (t && t.isContentEditable);
+        if (!editable) {
+          e.preventDefault();
+        }
+      });
+    })();
+  </script>
+</head>
+<body>
+  <!--
+    You can customize the "flutter_bootstrap.js" script.
+    This is useful to provide a custom configuration to the Flutter loader
+    or to give the user feedback during the initialization process.
+
+    For more details:
+    * https://docs.flutter.dev/platform-integration/web/initialization
+  -->
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

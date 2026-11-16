@@ -1,0 +1,191 @@
+name: ewt_auto_client
+description: "EWT360 自动化客户端 - Flutter 跨平台版"
+publish_to: 'none'
+version: 3.2.0+2
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # 中文本地化 (Material 组件文案/日期选择器等)
+  flutter_localizations:
+    sdk: flutter
+
+  # State Management
+  flutter_riverpod: ^2.6.1
+  riverpod_annotation: ^2.6.1
+
+  # Network
+  dio: ^5.7.0
+
+  # Routing
+  go_router: ^14.8.0
+
+  # Web platform interop (WebFileSaver / ffmpeg.wasm bridge)
+  web: ^1.1.1
+
+  # Serialization
+  freezed_annotation: ^2.4.4
+  json_annotation: ^4.9.0
+
+  # Crypto
+  encrypt: ^5.0.3
+  crypto: ^3.0.6
+  convert: ^3.1.2
+
+  # DI
+  get_it: ^8.0.3
+
+  # Storage
+  shared_preferences: ^2.3.4
+  path_provider: ^2.1.5
+
+  # UI
+  qr_flutter: ^4.1.0
+  cupertino_icons: ^1.0.8
+  # HTML 富文本渲染 (试题题干/解析, 支持 HTML 实体/图片/表格/内联样式)
+  flutter_html: ^3.0.0
+  # HTML 解析 (手写模拟渲染: 从答案/解析 HTML 提取文本与公式图片)
+  html: ^0.15.4
+  # LaTeX 公式渲染 (数理化公式, 与 flutter_html 集成)
+  flutter_math_fork: ^0.7.3
+
+  # Image processing (captcha gap detection)
+  image: ^4.5.0
+
+  # Camera capture (主观题"相机拍照": Android/iOS 调系统相机, 桌面端降级提示)
+  image_picker: ^1.1.2
+
+  # Utils
+  logger: ^2.5.0
+  intl: ^0.20.2
+  collection: ^1.19.0
+  uuid: ^4.5.1
+  url_launcher: ^6.3.1
+
+  # Video Player
+  media_kit: ^1.1.11
+  media_kit_video: ^1.2.5
+  media_kit_libs_video: ^1.0.5
+
+  # FFmpeg (跨平台 TS→MP4 remux, 支持 Android/Windows, Web 降级)
+  ffmpeg_kit_flutter_new_min: ^3.6.0
+
+  # path: 路径处理 (network_logger 等)
+  path: ^1.9.0
+
+  # PDF generation (试题导出)
+  pdf: ^3.11.1
+
+  # PDF 内嵌预览 (pdfrx: 禁止跳转外部阅读器, 支持页码/缩放/加载/错误态)
+  pdfrx: ^2.4.8
+
+  # File picker (选择自定义 TTF 字体文件)
+  file_picker: ^8.1.2
+  flutter_svg: ^2.3.0
+  # SVG 同步预校验 (flutter_svg 的底层解析器, 用于捕获 EWT 畸形公式 SVG
+  # 的 XmlParserException, 避免 Unhandled Exception)
+  vector_graphics_compiler: ^1.3.0
+  quickjs_engine: ^0.1.5
+  code_text_field: ^1.1.0
+  highlight: ^0.7.0
+  dio_http2_adapter: ^2.9.0
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  build_runner: ^2.4.14
+  freezed: ^2.5.7
+  json_serializable: ^6.9.0
+  riverpod_generator: ^2.6.3
+  # App 图标生成 (从 ewt_auto.png 生成 Android/iOS/Web/Windows 全平台 launcher icon)
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  # 源图: 2048x2048 PNG, 位于项目根目录 (pubspec.yaml 同级)
+  image_path: "ewt_auto.png"
+  # Android: 同时生成 legacy ic_launcher 和 adaptive icon (前景+背景)
+  android: true
+  # 本项目无 iOS 平台目录, 禁用 iOS 图标生成
+  ios: false
+  # 自适应图标前景图使用同一张图, 背景用纯色 (避免 PNG 被裁剪异常)
+  # adaptive_icon_background: "#FFFFFF"
+  # adaptive_icon_foreground: "ewt_auto.png"
+  # Web 平台 favicon / PWA 图标
+  web:
+    generate: true
+    image_path: "ewt_auto.png"
+  # Windows 桌面应用图标
+  windows:
+    generate: true
+    image_path: "ewt_auto.png"
+    icon_size: 256
+
+dependency_overrides:
+  # flutter_svg (http ^1.0.0) 和 image (archive ^4.0.1) 的传递依赖
+  # 在 pub 解析时可能回退到旧版, 显式锁定到兼容版本
+  http: ^1.2.2
+  archive: ^4.0.2
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/config/
+    - assets/changelog.json
+    - assets/images/
+    - assets/fonts/
+    - assets/scripts/
+
+  fonts:
+    - family: HarmonyOS
+      fonts:
+        - asset: assets/fonts/HarmonyOS_Sans_SC_Regular.ttf
+        - asset: assets/fonts/HarmonyOS_Sans_SC_Bold.ttf
+          weight: 700
+    # 中文手写字体 (OFL 开源协议, 来自 google/fonts 与 lxgw/LxgwWenKai)
+    - family: MaShanZheng
+      fonts:
+        - asset: assets/fonts/MaShanZheng-Regular.ttf
+    - family: LongCang
+      fonts:
+        - asset: assets/fonts/LongCang-Regular.ttf
+    - family: ZCOOLKuaiLe
+      fonts:
+        - asset: assets/fonts/ZCOOLKuaiLe-Regular.ttf
+    - family: ZhiMangXing
+      fonts:
+        - asset: assets/fonts/ZhiMangXing-Regular.ttf
+    - family: LiuJianMaoCao
+      fonts:
+        - asset: assets/fonts/LiuJianMaoCao-Regular.ttf
+    - family: LXGWWenKai
+      fonts:
+        - asset: assets/fonts/LXGWWenKai-Regular.ttf
+    # 扩展手写字体 (下载包, 名称见内部字体名)
+    - family: HanchanShouzhuo
+      fonts:
+        - asset: assets/fonts/HanchanShouzhuo-Regular.ttf
+    - family: XinyeNianti
+      fonts:
+        - asset: assets/fonts/XinyeNianti-Regular.otf
+    - family: LikeJianJian
+      fonts:
+        - asset: assets/fonts/LikeJianJian-Regular.ttf
+    - family: JiangxiZhuokai
+      fonts:
+        - asset: assets/fonts/JiangxiZhuokai-Regular.ttf
+    - family: MuyaoSuixin
+      fonts:
+        - asset: assets/fonts/MuyaoSuixin-Regular.ttf
+    - family: Youchazhi
+      fonts:
+        - asset: assets/fonts/Youchazhi-Regular.ttf
+    - family: BailuTongtong
+      fonts:
+        - asset: assets/fonts/BailuTongtong-Regular.ttf
+    - family: SuifengPlus
+      fonts:
+        - asset: assets/fonts/SuifengPlus-Regular.ttf

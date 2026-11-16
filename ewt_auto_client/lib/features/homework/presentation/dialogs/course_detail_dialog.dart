@@ -1,0 +1,951 @@
+/// 课程详情弹窗，展示课程讲次详情、视频信息、导学案/练习完成状态与服务端播放进度。
+/// 提供 userSession 时可播放视频并支持后台进度上报。
+library;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:ewt_auto_client/core/di/injection.dart';
+import 'package:ewt_auto_client/core/layout/app_breakpoints.dart';
+import 'package:ewt_auto_client/core/network/dio_client.dart';
+import 'package:ewt_auto_client/features/answer/data/datasources/answer_remote_datasource.dart';
+import 'package:ewt_auto_client/features/auth/domain/entities/user_session.dart';
+import 'package:ewt_auto_client/features/player/data/datasources/player_remote_datasource.dart';
+import 'package:ewt_auto_client/features/player/presentation/services/video_play_launcher.dart';
+import 'package:ewt_auto_client/features/settings/presentation/providers/settings_provider.dart';
+
+/// 课程详情弹窗
+///
+/// 点击课程卡片后打开，展示课程讲次详情 + 视频信息
+/// 对应 Python: gui/dialogs/course.py CourseDetailDialog
+class CourseDetailDialog extends StatefulWidget {
+  /// 课程列表中的原始数据 (pageHomeworkTasks 返回的 item)
+  final Map<String, dynamic> courseData;
+  final String homeworkId;
+  final String schoolId;
+
+  /// 用户会话 (提供时启用播放视频 + 后台进度上报)
+  final UserSession? userSession;
+
+  const CourseDetailDialog({
+    super.key,
+    required this.courseData,
+    required this.homeworkId,
+    required this.schoolId,
+    this.userSession,
+  });
+
+  @override
+  State<CourseDetailDialog> createState() => _CourseDetailDialogState();
+}
+
+class _CourseDetailDialogState extends State<CourseDetailDialog> {
+  bool _loading = true;
+  String? _error;
+  Map<String, dynamic> _lessonData = {};
+
+  /// getExternalVideoInfo 的完整响应 (含 videoList), 供点击"播放视频"时
+  /// 调用 [VideoSourceResolver] 解析真实播放地址。
+  Map<String, dynamic> _videoInfo = {};
+
+  /// 是否有可解析的视频源 (videoList 非空)
+  bool _hasVideoSource = false;
+
+  /// 导学案与练习完成状态 (queryStudentLessonStudyGuideAndPractice 返回的匹配项)
+  ///
+  /// 包含 studyGuidePdfWithWaterMark (导学案 PDF 链接) 和 studyTest (试卷完成状态:
+  /// finishStatus/correctStatus/isAllRight/hasWrongQuestion/reportId/paperId/questionCount)。
+  Map<String, dynamic> _studyGuideInfo = {};
+
+  /// 服务端播放进度 (getUserHomeworkLessonTaskInfo 返回)
+  ///
+  /// 字段: playTime(ms) / percent / finishPlayTime(ms) / finishPercent /
+  ///       lessonTime(ms) / lessonId
+  /// 仅 homeworkId 非空时获取, 用于展示真实已播放进度和续播起点。
+  Map<String, dynamic> _taskInfo = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDetail();
+  }
+
+  Future<void> _loadDetail() async {
+    try {
+      final client = PlayerRemoteDataSource(getIt<DioClient>());
+      final lessonId =
+          (widget.courseData['lessonId'] ?? widget.courseData['contentId'] ?? '')
+              .toString();
+
+      // 获取课程讲次详情
+      final lesson = await client.getLessonDetail(
+        schoolId: widget.schoolId,
+        homeworkId: widget.homeworkId,
+        lessonId: lessonId,
+      );
+
+      // 获取服务端播放进度 (getUserHomeworkLessonTaskInfo)
+      // 仅 homeworkId 非空时调用 (接口要求作业ID非空, 周培优场景跳过)
+      Map<String, dynamic> taskInfo = {};
+      if (widget.homeworkId.isNotEmpty) {
+        try {
+          final contentType = widget.courseData['contentType'] is int
+              ? widget.courseData['contentType'] as int
+              : int.tryParse(widget.courseData['contentType']?.toString() ?? '') ?? 1;
+          taskInfo = await client.getLessonTaskInfo(
+            homeworkId: widget.homeworkId,
+            lessonId: lessonId,
+            contentType: contentType,
+            schoolId: widget.schoolId,
+          );
+        } catch (_) {}
+      }
+
+      // 高级设置：会员鉴权越权 (contentType=1 被拦时回退 ct=3)
+      final memberBypass =
+          getIt<ProviderContainer>().read(appSettingsProvider).memberAuthBypass;
+      // 获取视频源信息 (暂不解析真实地址, 点击"播放视频"时再解析)
+      Map<String, dynamic> videoInfo = {};
+      bool hasSource = false;
+      try {
+        final token = await client.getPlayerToken(
+          schoolId: widget.schoolId,
+          lessonId: lessonId,
+          memberAuthBypass: memberBypass,
+        );
+        if (token.isNotEmpty) {
+          // PlayerRemoteDataSource.getExternalVideoInfo 返回 Map (含 videoList),
+          // 而非 HomeworkRemoteDataSource 的 List (其内部已做了一次提取, 但因
+          // getPlayerToken 返回 token 错误导致整体失败)。
+          videoInfo = await client.getExternalVideoInfo(
+            lessonId: lessonId,
+            videoToken: token,
+            contentType: memberBypass ? 3 : null,
+          );
+          final videoList =
+              (videoInfo['videoList'] as List<dynamic>?) ?? [];
+          hasSource = videoList.isNotEmpty;
+        }
+      } catch (_) {}
+
+      // 获取导学案与练习完成状态 (queryStudentLessonStudyGuideAndPractice)
+      Map<String, dynamic> studyGuideInfo = {};
+      try {
+        final answerClient = AnswerRemoteDataSource(getIt<DioClient>());
+        final taskId = (widget.courseData['taskId'] ?? '').toString();
+        final sgResult = await answerClient.getStudyGuideAndPractice(
+          schoolId: widget.schoolId,
+          homeworkId: widget.homeworkId,
+          taskIds: taskId.isNotEmpty ? [taskId] : [],
+          lessonIds: [lessonId],
+        );
+        // 响应为列表, 按 lessonId 匹配当前讲次
+        final list = (sgResult['list'] as List<dynamic>?) ?? [];
+        for (final item in list) {
+          if (item is Map<String, dynamic> &&
+              item['lessonId']?.toString() == lessonId) {
+            studyGuideInfo = item;
+            break;
+          }
+        }
+      } catch (_) {}
+
+      if (mounted) {
+        setState(() {
+          _lessonData = lesson;
+          _taskInfo = taskInfo;
+          _videoInfo = videoInfo;
+          _hasVideoSource = hasSource;
+          _studyGuideInfo = studyGuideInfo;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = '$e';
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  /// 点击"播放视频": 通过 [VideoPlayLauncher] 解析真实地址 + 构建上报会话 + 跳转播放页
+  ///
+  /// 使用统一的 VideoPlayLauncher 同时完成:
+  /// - 视频源解析 (腾讯云/阿里云)
+  /// - BFE 会话获取 + VideoSession 构建
+  /// - 后台进度上报启动 + 日志侧边栏
+  Future<void> _onPlayVideo() async {
+    final lessonId = (widget.courseData['lessonId'] ??
+            widget.courseData['contentId'] ??
+            '')
+        .toString();
+    final videoId = (widget.courseData['videoId'] ?? '').toString();
+    final taskId = (widget.courseData['taskId'] ?? '').toString();
+    final contentType = widget.courseData['contentType'] is int
+        ? widget.courseData['contentType'] as int
+        : int.tryParse(widget.courseData['contentType']?.toString() ?? '') ?? 1;
+    final duration = widget.courseData['duration'] is int
+        ? widget.courseData['duration'] as int
+        : int.tryParse(widget.courseData['duration']?.toString() ?? '') ?? 0;
+    final title = (_lessonData['lessonName'] ??
+            widget.courseData['title'] ??
+            '视频播放')
+        .toString();
+
+    await VideoPlayLauncher.start(
+      context: context,
+      videoInfo: _videoInfo,
+      lessonId: lessonId,
+      homeworkId: widget.homeworkId,
+      videoId: videoId,
+      taskId: taskId,
+      contentType: contentType,
+      duration: duration,
+      title: title,
+      userSession: widget.userSession,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final course = widget.courseData;
+    final title = (_lessonData['lessonName'] ??
+            course['title'] ??
+            course['homeworkTitle'] ??
+            '课程详情')
+        .toString();
+
+    return Dialog(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: AppBreakpoints.dialogMaxWidth, maxHeight: 700),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 标题栏
+            _buildHeader(theme, title),
+            const Divider(height: 1),
+            // 内容区
+            Flexible(
+              child: _loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _error != null
+                      ? _buildError(theme)
+                      : _buildContent(theme),
+            ),
+            const Divider(height: 1),
+            // 底部按钮
+            _buildActions(theme),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHeader(ThemeData theme, String title) {
+    final sortName = _lessonData['sortName']?.toString() ?? '';
+    final packageName = _lessonData['packageName']?.toString() ?? '';
+    final subtitle = [
+      if (sortName.isNotEmpty) sortName,
+      if (packageName.isNotEmpty) packageName,
+    ].join(' · ');
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 20, 12, 12),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: theme.textTheme.titleLarge,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (subtitle.isNotEmpty) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    subtitle,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close),
+            onPressed: () => Navigator.pop(context),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildError(ThemeData theme) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.error_outline,
+                size: 48, color: theme.colorScheme.error),
+            const SizedBox(height: 12),
+            Text('加载失败', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Text(
+              _error!,
+              style: theme.textTheme.bodySmall,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            FilledButton.tonal(
+              onPressed: () {
+                setState(() {
+                  _loading = true;
+                  _error = null;
+                });
+                _loadDetail();
+              },
+              child: const Text('重试'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildContent(ThemeData theme) {
+    final course = widget.courseData;
+    final lesson = _lessonData;
+
+    return ListView(
+      padding: const EdgeInsets.all(24),
+      children: [
+        // 课程描述
+        if ((lesson['description']?.toString() ?? '').isNotEmpty) ...[
+          Text(
+            lesson['description'].toString(),
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 20),
+        ],
+
+        // 基本信息
+        _buildSectionTitle(theme, '基本信息'),
+        const SizedBox(height: 8),
+        _buildInfoGrid(theme, [
+          _InfoItem('学科',
+              (lesson['subjectName'] ?? course['subjectName'] ?? '-').toString()),
+          _InfoItem('类型',
+              (lesson['contentTypeName'] ?? course['contentTypeName'] ?? '-')
+                  .toString()),
+          _InfoItem('授课教师', (lesson['teacherName'] ?? '-').toString()),
+          _InfoItem('视频时长', _formatDuration(lesson['videoPlayTime'])),
+          // 优先使用服务端 playTime (getUserHomeworkLessonTaskInfo), 更准确;
+          // 回退到列表接口的 clientPlayTime
+          _InfoItem('已播放', _formatDurationMs(
+              _taskInfo['playTime'] ?? course['clientPlayTime'])),
+          _InfoItem('播放次数', (lesson['hitCount'] ?? 0).toString()),
+        ]),
+
+        // 服务端播放进度详情 (getUserHomeworkLessonTaskInfo)
+        if (_taskInfo.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          _buildInfoGrid(theme, [
+            _InfoItem('完成进度',
+                _taskInfo['percent'] != null
+                    ? '${(_toDouble(_taskInfo['percent']) * 100).toStringAsFixed(0)}%'
+                    : '-'),
+            _InfoItem('完成阈值',
+                _taskInfo['finishPercent'] != null
+                    ? '${(_toDouble(_taskInfo['finishPercent']) * 100).toStringAsFixed(0)}%'
+                    : '-'),
+            _InfoItem('完成时长', _formatDurationMs(_taskInfo['finishPlayTime'])),
+            _InfoItem('视频时长(ms)', _formatDurationMs(_taskInfo['lessonTime'])),
+          ]),
+        ],
+
+        // 教师简介
+        if (_getTeacherDescription().isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text(
+            '教师简介: ${_getTeacherDescription()}',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+
+        const SizedBox(height: 20),
+
+        // 学习要求
+        _buildSectionTitle(theme, '学习要求'),
+        const SizedBox(height: 8),
+        _buildInfoGrid(theme, [
+          _InfoItem('需要考点',
+              _boolLabel(lesson['needCheckPoint'] ?? course['needCheckPoint'])),
+          _InfoItem('互动视频', _boolLabel(lesson['interactiveVideo'])),
+          _InfoItem('必学要求',
+              (course['mustLearning'] == 1) ? '必学' : '选学'),
+          _InfoItem('认真度检测', _seriousCheckLabel(course['seriousCheckResult'])),
+          _InfoItem('作业全部完成', _boolLabel(course['allFinished'])),
+        ]),
+
+        const SizedBox(height: 20),
+
+        // 任务状态
+        _buildSectionTitle(theme, '任务状态'),
+        const SizedBox(height: 8),
+        _buildTaskStatus(theme),
+
+        // 导学案与练习完成状态 (queryStudentLessonStudyGuideAndPractice)
+        if (_studyGuideInfo.isNotEmpty) ...[
+          const SizedBox(height: 20),
+          _buildSectionTitle(theme, '导学案与练习'),
+          const SizedBox(height: 8),
+          _buildStudyGuideAndPractice(theme),
+        ],
+
+        const SizedBox(height: 20),
+
+        // 技术信息
+        _buildSectionTitle(theme, '技术信息'),
+        const SizedBox(height: 8),
+        _buildInfoGrid(theme, [
+          _InfoItem('课程ID', (lesson['id'] ?? '-').toString()),
+          _InfoItem('内容ID', (course['contentId'] ?? '-').toString()),
+          _InfoItem('视频编码', (lesson['videoCode'] ?? '-').toString()),
+          _InfoItem('任务ID', (course['taskId'] ?? '-').toString()),
+          _InfoItem('导学案ID', (course['studyGuideId'] ?? '-').toString()),
+          _InfoItem('父内容ID', (course['parentContentId'] ?? '-').toString()),
+        ]),
+
+        // 课程链接
+        if ((course['contentUrl']?.toString() ?? '').isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              InkWell(
+                onTap: () {
+                  final url = _buildInjectedUrl(course['contentUrl'].toString());
+                  Clipboard.setData(ClipboardData(text: url));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('链接已复制到剪贴板')),
+                  );
+                },
+                child: Row(
+                  children: [
+                    Icon(Icons.link, size: 16, color: theme.colorScheme.primary),
+                    const SizedBox(width: 4),
+                    Text(
+                      '复制课程链接',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.primary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 20),
+              InkWell(
+                onTap: () {
+                  final url = _buildInjectedUrl(course['contentUrl'].toString());
+                  launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+                },
+                child: Row(
+                  children: [
+                    Icon(Icons.open_in_browser, size: 16, color: theme.colorScheme.primary),
+                    const SizedBox(width: 4),
+                    Text(
+                      '浏览器打开',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.primary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildSectionTitle(ThemeData theme, String text) {
+    return Text(
+      text,
+      style: theme.textTheme.titleSmall?.copyWith(
+        color: theme.colorScheme.primary,
+        fontWeight: FontWeight.w600,
+      ),
+    );
+  }
+
+  Widget _buildInfoGrid(ThemeData theme, List<_InfoItem> items) {
+    return Wrap(
+      spacing: 24,
+      runSpacing: 8,
+      children: items
+          .map((item) => SizedBox(
+                width: 180,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${item.label}: ',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    Expanded(
+                      child: Text(
+                        item.value,
+                        style: theme.textTheme.bodySmall,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ))
+          .toList(),
+    );
+  }
+
+  Widget _buildTaskStatus(ThemeData theme) {
+    final course = widget.courseData;
+    final contentTypeName = course['contentTypeName']?.toString() ?? '';
+    final isPaper = contentTypeName.contains('试卷') ||
+        contentTypeName.contains('作业') ||
+        contentTypeName.contains('考试');
+
+    // 观看/完成进度
+    final ratio = (course['ratio'] is num)
+        ? (course['ratio'] as num).toDouble()
+        : 0.0;
+    final clientPlayTime = course['clientPlayTime'];
+    final playMs = clientPlayTime is num ? clientPlayTime.toInt() : 0;
+
+    // 作业完成状态: 统一使用 queryStudentLessonStudyGuideAndPractice 的 finishStatus
+    // (与 _CourseCard 判定一致: homeworkFinishStatus 由 provider 合并,
+    //  或从本弹窗独立获取的 _studyGuideInfo 计算)
+    final taskId = course['taskId']?.toString() ?? '';
+    final hasHomework = taskId.isNotEmpty && taskId != '0';
+    final homeworkDone = _resolveHomeworkDone();
+
+    String statusText;
+    Color statusColor;
+    if (!hasHomework) {
+      statusText = '无作业';
+      statusColor = theme.colorScheme.onSurfaceVariant;
+    } else if (homeworkDone) {
+      statusText = '已完成';
+      statusColor = Colors.green;
+    } else if (ratio > 0 || playMs > 0) {
+      statusText = '进行中';
+      statusColor = theme.colorScheme.primary;
+    } else {
+      statusText = '未开始';
+      statusColor = theme.colorScheme.onSurfaceVariant;
+    }
+
+    // 进度标签
+    final progressLabel = isPaper ? '完成进度' : '观看进度';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // 任务状态行
+        Row(
+          children: [
+            Container(
+              width: 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: statusColor,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text('作业: $statusText', style: theme.textTheme.bodyMedium),
+          ],
+        ),
+        // 观看/完成进度
+        if (ratio > 0 || playMs > 0) ...[
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Icon(
+                isPaper ? Icons.description_outlined : Icons.play_circle_outline,
+                size: 16,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '$progressLabel: ${(ratio * 100).toStringAsFixed(0)}%',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+              if (!isPaper && playMs > 0) ...[
+                const SizedBox(width: 8),
+                Text(
+                  '(${_formatDurationMs(playMs)})',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.7),
+                  ),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 6),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(2),
+            child: LinearProgressIndicator(
+              value: ratio.clamp(0.0, 1.0),
+              minHeight: 4,
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  /// 解析作业完成状态
+  ///
+  /// 优先使用 course['homeworkFinishStatus'] (由 HomeworkNotifier._mergeStudyGuideStatus
+  /// 从 queryStudentLessonStudyGuideAndPractice 合并), 其次从本弹窗独立获取的
+  /// _studyGuideInfo (studyTest/practiceSheet finishStatus) 计算。
+  bool _resolveHomeworkDone() {
+    final course = widget.courseData;
+    final hfs = course['homeworkFinishStatus'];
+    if (hfs != null) return hfs == 1 || hfs == true;
+
+    final studyTest = _studyGuideInfo['studyTest'];
+    final practiceSheet = _studyGuideInfo['practiceSheet'];
+    if (studyTest is Map<String, dynamic> &&
+        (studyTest['finishStatus'] == 1 ||
+            studyTest['finishStatus'] == true)) {
+      return true;
+    }
+    if (practiceSheet is Map<String, dynamic> &&
+        (practiceSheet['finishStatus'] == 1 ||
+            practiceSheet['finishStatus'] == true)) {
+      return true;
+    }
+    return false;
+  }
+
+  /// 导学案与练习完成状态展示
+  ///
+  /// 数据来源: queryStudentLessonStudyGuideAndPractice 接口返回的匹配项
+  /// - 导学案: studyGuidePdfWithWaterMark (PDF 链接)
+  /// - 随堂练/试卷: studyTest.{finishStatus, correctStatus, isAllRight,
+  ///   hasWrongQuestion, wrongQuestionUnSelfCorrect, reportId, paperId, questionCount}
+  /// - 课后练习: practiceSheet (同 studyTest 结构)
+  Widget _buildStudyGuideAndPractice(ThemeData theme) {
+    final guideUrl =
+        (_studyGuideInfo['studyGuidePdfWithWaterMark'] ?? '').toString();
+    final studyTest = _studyGuideInfo['studyTest'];
+    final practiceSheet = _studyGuideInfo['practiceSheet'];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // 导学案
+        if (guideUrl.isNotEmpty)
+          _buildGuideRow(theme, '导学案', guideUrl)
+        else
+          _buildStatusChip(theme, '导学案', '无', false),
+
+        // 随堂练/试卷
+        if (studyTest is Map<String, dynamic>) ...[
+          const SizedBox(height: 10),
+          _buildPracticeSection(theme, '随堂练', studyTest),
+        ],
+
+        // 课后练习
+        if (practiceSheet is Map<String, dynamic>) ...[
+          const SizedBox(height: 10),
+          _buildPracticeSection(theme, '课后练习', practiceSheet),
+        ],
+      ],
+    );
+  }
+
+  /// 导学案行: 状态 + 复制链接 + 浏览器打开
+  Widget _buildGuideRow(ThemeData theme, String label, String url) {
+    // 使用 Wrap 布局: "导学案: 已提供"文本与按钮组在宽度不足时自动换行,
+    // 两个按钮(复制链接/打开)始终放在一起(用 Row 包裹)。
+    return Wrap(
+      crossAxisAlignment: WrapCrossAlignment.center,
+      spacing: 12,
+      runSpacing: 6,
+      children: [
+        // 第一组: 图标 + "导学案: 已提供"
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.picture_as_pdf_outlined,
+                size: 16, color: theme.colorScheme.primary),
+            const SizedBox(width: 6),
+            Text('$label: ', style: theme.textTheme.bodySmall),
+            Text('已提供',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: Colors.green)),
+          ],
+        ),
+        // 第二组: 两个按钮放在一起
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            InkWell(
+              onTap: () {
+                Clipboard.setData(ClipboardData(text: url));
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('导学案链接已复制')),
+                );
+              },
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.copy_outlined,
+                      size: 14, color: theme.colorScheme.primary),
+                  const SizedBox(width: 4),
+                  Text('复制链接',
+                      style: theme.textTheme.bodySmall
+                          ?.copyWith(color: theme.colorScheme.primary)),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            InkWell(
+              onTap: () {
+                launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+              },
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.open_in_browser,
+                      size: 14, color: theme.colorScheme.primary),
+                  const SizedBox(width: 4),
+                  Text('打开',
+                      style: theme.textTheme.bodySmall
+                          ?.copyWith(color: theme.colorScheme.primary)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// 试卷/练习完成状态区块
+  Widget _buildPracticeSection(
+      ThemeData theme, String label, Map<String, dynamic> data) {
+    final finishStatus = data['finishStatus'];
+    final correctStatus = data['correctStatus'];
+    final isAllRight = data['isAllRight'];
+    final hasWrong = data['hasWrongQuestion'];
+    final questionCount = data['questionCount'];
+    final reportId = (data['reportId'] ?? '').toString();
+    final paperId = (data['paperId'] ?? '').toString();
+
+    // finishStatus: 1=已完成, 0/null=未完成
+    final finished = finishStatus == 1 || finishStatus == true;
+    // correctStatus: 2=已批改, 1=待批改, 0/null=未批改
+    final corrected = correctStatus == 2;
+    final pendingCorrect = correctStatus == 1;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // 标题 + 完成状态
+        Row(
+          children: [
+            Icon(Icons.edit_note_outlined,
+                size: 16, color: theme.colorScheme.onSurfaceVariant),
+            const SizedBox(width: 6),
+            Text('$label: ', style: theme.textTheme.bodySmall),
+            _buildStatusChip(theme, '作答', finished ? '已完成' : '未完成', finished),
+            const SizedBox(width: 8),
+            if (corrected)
+              _buildStatusChip(theme, '批改', '已批改', true)
+            else if (pendingCorrect)
+              _buildStatusChip(theme, '批改', '待批改', false)
+            else
+              _buildStatusChip(theme, '批改', '未批改', false),
+          ],
+        ),
+        const SizedBox(height: 6),
+        // 详细信息
+        _buildInfoGrid(theme, [
+          _InfoItem('题量', questionCount != null ? '$questionCount 题' : '-'),
+          _InfoItem('试卷ID', paperId.isNotEmpty ? paperId : '-'),
+          _InfoItem('报告ID', reportId.isNotEmpty ? reportId : '-'),
+          if (isAllRight != null)
+            _InfoItem('全部正确', isAllRight == true ? '是' : '否'),
+          if (hasWrong != null)
+            _InfoItem('有错题', hasWrong == true ? '是' : '否'),
+        ]),
+      ],
+    );
+  }
+
+  /// 状态标签芯片
+  Widget _buildStatusChip(
+      ThemeData theme, String label, String value, bool ok) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: ok
+            ? Colors.green.withValues(alpha: 0.1)
+            : theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        '$label: $value',
+        style: theme.textTheme.labelSmall?.copyWith(
+          color: ok ? Colors.green : theme.colorScheme.onSurfaceVariant,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActions(ThemeData theme) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          if (_hasVideoSource)
+            FilledButton.icon(
+              icon: const Icon(Icons.play_arrow, size: 18),
+              label: const Text('播放视频'),
+              onPressed: _onPlayVideo,
+            ),
+          const SizedBox(width: 8),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ─── Helpers ───
+
+  /// 构建注入参数后的课程链接
+  ///
+  /// 原始: ...#/homework/play-videos?courseId=X&lessonId=Y&videoPoint=1&homeworkId=Z
+  /// 注入: ...#/homework/play-videos?role=student&courseId=X&lessonId=Y&videoType=1
+  ///       &homeworkId=Z&onlyMustLearn=1&isNewPlayer=1&videoPoint=0&date=`<ts>`
+  String _buildInjectedUrl(String originalUrl) {
+    final hashIndex = originalUrl.indexOf('#');
+    if (hashIndex == -1) return originalUrl;
+
+    final base = originalUrl.substring(0, hashIndex);
+    final fragment = originalUrl.substring(hashIndex + 1);
+
+    // 分离 fragment 路径和 query
+    final qIndex = fragment.indexOf('?');
+    final path = qIndex == -1 ? fragment : fragment.substring(0, qIndex);
+    final query = qIndex == -1 ? '' : fragment.substring(qIndex + 1);
+
+    // 解析现有参数
+    final params = <String, String>{};
+    if (query.isNotEmpty) {
+      for (final pair in query.split('&')) {
+        final eq = pair.indexOf('=');
+        if (eq > 0) {
+          params[pair.substring(0, eq)] = pair.substring(eq + 1);
+        }
+      }
+    }
+
+    // 注入/覆盖参数
+    params['role'] = 'student';
+    params['videoType'] = '1';
+    params['onlyMustLearn'] = '1';
+    params['isNewPlayer'] = '1';
+    params['videoPoint'] = '0';
+    params['date'] = DateTime.now().millisecondsSinceEpoch.toString();
+
+    // 重建 query string
+    final newQuery = params.entries.map((e) => '${e.key}=${e.value}').join('&');
+    return '$base#$path?$newQuery';
+  }
+
+  String _getTeacherDescription() {
+    final teacherList = _lessonData['teacherList'];
+    if (teacherList is List && teacherList.isNotEmpty) {
+      final first = teacherList[0];
+      if (first is Map) {
+        return (first['description'] ?? '').toString();
+      }
+    }
+    return '';
+  }
+
+  String _formatDuration(dynamic seconds) {
+    if (seconds == null) return '-';
+    final s = seconds is num ? seconds.toInt() : int.tryParse('$seconds') ?? 0;
+    if (s <= 0) return '-';
+    final m = s ~/ 60;
+    final sec = s % 60;
+    return m > 0 ? '$m分$sec秒' : '$sec秒';
+  }
+
+  String _formatDurationMs(dynamic ms) {
+    if (ms == null) return '-';
+    final millis = ms is num ? ms.toInt() : int.tryParse('$ms') ?? 0;
+    if (millis <= 0) return '0秒';
+    final s = millis ~/ 1000;
+    final m = s ~/ 60;
+    final sec = s % 60;
+    return m > 0 ? '$m分$sec秒' : '$sec秒';
+  }
+
+  /// 将动态值转换为 double (用于 percent/finishPercent 等比例字段)
+  double _toDouble(dynamic v) {
+    if (v == null) return 0.0;
+    if (v is num) return v.toDouble();
+    return double.tryParse(v.toString()) ?? 0.0;
+  }
+
+  String _boolLabel(dynamic value) {
+    if (value == true || value == 1 || value == '1') return '是';
+    return '否';
+  }
+
+  String _seriousCheckLabel(dynamic value) {
+    switch (value) {
+      case 1:
+        return '不通过';
+      case 2:
+        return '已通过';
+      default:
+        return '未校验';
+    }
+  }
+}
+
+class _InfoItem {
+  final String label;
+  final String value;
+  const _InfoItem(this.label, this.value);
+}
